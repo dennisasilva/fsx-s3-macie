@@ -380,7 +380,7 @@ Resources:
                   
                   # Construir mensagem de alerta
                   message = f"🔍 ALERTA DE COMPLIANCE - FSx for Windows\n\n"
-                  message += f"ℹ️ {action_level} - {action_description}\n\n"
+                  message += f"{action_level} - {action_description}\n\n"
                   message += f"📁 Arquivo Original: {original_fsx_path}\n"
                   message += f"📊 Severidade: {severity_description} (Score: {severity_score})\n"
                   message += f"🏷️ Tipo de Dados: {finding_type}\n"
