@@ -2,19 +2,19 @@ FSx Compliance PoC - Deployment Information
 Generated: Wed Aug 13 13:47:55 -03 2025
 
 Infrastructure:
-- FSx DNS Name: amznfsxypjjahvl.fsx-compliance-poc.local
-- S3 Bucket: fsx-compliance-poc-storage-compliancebucket-iiwahzsr5xeu
+- FSx DNS Name: aaaaaaaaaa.fsx-compliance-poc.local
+- S3 Bucket: fsx-compliance-poc-storage-compliancebucket-aaaaaaaaa
 - Windows Instance IP: 10.0.1.245
-- Windows Instance ID: i-026e0e758feb4fd9a
-- SNS Topic: arn:aws:sns:us-east-1:493301683711:fsx-compliance-poc-compliance-alerts
-- Notification Email: dsdennis@amazon.com
+- Windows Instance ID: i-2093849021384092
+- SNS Topic: arn:aws:sns:us-east-1:123456789012:fsx-compliance-poc-compliance-alerts
+- Notification Email: dennis@dennis.com
 - Region: us-east-1
 
 Access Commands:
-- Session Manager: aws ssm start-session --target i-026e0e758feb4fd9a --region us-east-1
-- PowerShell: aws ssm start-session --target i-026e0e758feb4fd9a --region us-east-1 --document-name AWS-StartPowerShellSession
+- Session Manager: aws ssm start-session --target i-20348092384 --region us-east-1
+- PowerShell: aws ssm start-session --target i-20348092384 --region us-east-1 --document-name AWS-StartPowerShellSession
 
 Monitoring:
 - Macie Console: https://console.aws.amazon.com/macie/
-- S3 Console: https://s3.console.aws.amazon.com/s3/buckets/fsx-compliance-poc-storage-compliancebucket-iiwahzsr5xeu
+- S3 Console: https://s3.console.aws.amazon.com/s3/buckets/fsx-compliance-poc-storage-compliancebucket-aaaaaaaaa
 - CloudWatch: https://console.aws.amazon.com/cloudwatch/
