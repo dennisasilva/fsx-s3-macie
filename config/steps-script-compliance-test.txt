@@ -1,0 +1,35 @@
+## ▶️ Agora Execute o Teste
+
+bash
+# 1. Executar teste completo (gerar 3 arquivos)
+./test.sh 3 test
+
+# 2. Criar job imediato do Macie
+./test.sh 0 job
+
+# 3. Monitorar findings (aguarde alguns minutos)
+./test.sh 0 monitor
+
+
+## 🔧 Se Precisar Instalar jq
+
+bash
+# Instalar jq para melhor formatação (opcional)
+sudo yum update -y
+sudo yum install -y jq
+
+
+## 📊 Comandos de Verificação
+
+bash
+# Ver buckets S3
+aws s3 ls | grep compliance
+
+# Ver arquivos no bucket
+aws s3 ls s3://SEU-BUCKET-COMPLIANCE/fsx-sync/ --recursive
+
+# Ver findings simples
+aws macie2 list-findings --region us-east-1 --query 'findingIds | length(@)'
+
+# Ver jobs do Macie
+aws macie2 list-classification-jobs --region us-east-1 --query 'items[].{Name:name,Status:jobStatus}'

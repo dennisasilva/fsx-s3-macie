@@ -1,0 +1,552 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Amazon Macie e processamento de findings para FSx Compliance PoC'
+
+Parameters:
+  MainStackName:
+    Type: String
+    Description: 'Nome da stack principal para importar valores'
+  
+  StorageStackName:
+    Type: String
+    Description: 'Nome da stack de storage para importar valores'
+
+Resources:
+  # ============================================================================
+  # AMAZON MACIE CONFIGURATION VIA LAMBDA CUSTOMIZADO
+  # ============================================================================
+  
+  # Role para o Lambda de setup do Macie
+  MacieSetupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 
+        - '${ProjectName}-macie-setup-role'
+        - ProjectName: !ImportValue 
+            Fn::Sub: '${MainStackName}-ProjectName'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: MacieSetupPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - macie2:*
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:GetBucketLocation
+                  - s3:ListBucket
+                Resource: 
+                  - !Sub 
+                    - 'arn:aws:s3:::${BucketName}'
+                    - BucketName: !ImportValue 
+                        Fn::Sub: '${StorageStackName}-ComplianceBucket'
+      Tags:
+        - Key: Name
+          Value: !Sub 
+            - '${ProjectName}-macie-setup-role'
+            - ProjectName: !ImportValue 
+                Fn::Sub: '${MainStackName}-ProjectName'
+        - Key: Project
+          Value: !ImportValue 
+            Fn::Sub: '${MainStackName}-ProjectName'
+
+  # Lambda para configurar Macie2 (substitui recursos CloudFormation não suportados)
+  MacieSetupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 
+        - '${ProjectName}-macie-setup'
+        - ProjectName: !ImportValue 
+            Fn::Sub: '${MainStackName}-ProjectName'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Timeout: 900
+      MemorySize: 256
+      Environment:
+        Variables:
+          PROJECT_NAME: !ImportValue 
+            Fn::Sub: '${MainStackName}-ProjectName'
+          COMPLIANCE_BUCKET: !ImportValue 
+            Fn::Sub: '${StorageStackName}-ComplianceBucket'
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import cfnresponse
+          import time
+          
+          def lambda_handler(event, context):
+              try:
+                  macie = boto3.client('macie2')
+                  project_name = event['ResourceProperties']['ProjectName']
+                  bucket_name = event['ResourceProperties']['BucketName']
+                  
+                  if event['RequestType'] == 'Create' or event['RequestType'] == 'Update':
+                      # 1. Habilitar Macie2
+                      try:
+                          macie.enable_macie()
+                          print("Macie2 habilitado com sucesso")
+                      except macie.exceptions.ConflictException:
+                          print("Macie2 já está habilitado")
+                      except Exception as e:
+                          print(f"Erro ao habilitar Macie2: {str(e)}")
+                      
+                      # Aguardar um pouco para o Macie2 inicializar
+                      time.sleep(30)
+                      
+                      # 2. Criar Custom Data Identifier
+                      try:
+                          cdi_response = macie.create_custom_data_identifier(
+                              name=f"{project_name}-compliance-keywords",
+                              description="Identifica palavras-chave de compliance em documentos",
+                              regex=r"(?i)(confidencial|restrito|sigiloso|classified|senha|password|cpf:\s*\d{3}\.?\d{3}\.?\d{3}-?\d{2}|ssn:\s*\d{3}-?\d{2}-?\d{4})",
+                              keywords=[
+                                  'CONFIDENCIAL',
+                                  'RESTRITO', 
+                                  'SIGILOSO',
+                                  'CLASSIFIED',
+                                  'SENHA',
+                                  'PASSWORD',
+                                  'CARTÃO DE CRÉDITO',
+                                  'CREDIT CARD',
+                                  'DADOS PESSOAIS',
+                                  'PERSONAL DATA'
+                              ],
+                              maximumMatchDistance=50,
+                              tags={
+                                  'Name': f"{project_name}-compliance-identifier",
+                                  'Project': project_name
+                              }
+                          )
+                          cdi_id = cdi_response['customDataIdentifierId']
+                          print(f"Custom Data Identifier criado: {cdi_id}")
+                      except Exception as e:
+                          print(f"Erro ao criar Custom Data Identifier: {str(e)}")
+                          cdi_id = None
+                      
+                      # 3. Criar Classification Job
+                      try:
+                          job_response = macie.create_classification_job(
+                              jobType='SCHEDULED',
+                              name=f"{project_name}-scheduled-compliance-job",
+                              description="Job agendado para escanear arquivos FSx para compliance",
+                              s3JobDefinition={
+                                  'bucketDefinitions': [{
+                                      'accountId': context.invoked_function_arn.split(':')[4],
+                                      'buckets': [bucket_name]
+                                  }],
+                                  'scoping': {
+                                      'includes': {
+                                          'and': [
+                                              {
+                                                  'simpleScopeTerm': {
+                                                      'comparator': 'STARTS_WITH',
+                                                      'key': 'OBJECT_KEY',
+                                                      'values': ['fsx-sync/']
+                                                  }
+                                              },
+                                              {
+                                                  'simpleScopeTerm': {
+                                                      'comparator': 'EQ',
+                                                      'key': 'OBJECT_EXTENSION', 
+                                                      'values': ['pdf', 'doc', 'docx', 'txt', 'xlsx', 'ppt', 'pptx']
+                                                  }
+                                              }
+                                          ]
+                                      }
+                                  }
+                              },
+                              scheduleFrequency={
+                                  'dailySchedule': {}
+                              },
+                              customDataIdentifierIds=[cdi_id] if cdi_id else [],
+                              tags={
+                                  'Name': f"{project_name}-scheduled-job",
+                                  'Project': project_name
+                              }
+                          )
+                          job_id = job_response['jobId']
+                          print(f"Classification Job criado: {job_id}")
+                          
+                          cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                              'MacieEnabled': 'true',
+                              'CustomDataIdentifierId': cdi_id or 'none',
+                              'ClassificationJobId': job_id
+                          })
+                          
+                      except Exception as e:
+                          print(f"Erro ao criar Classification Job: {str(e)}")
+                          cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                              'MacieEnabled': 'true',
+                              'CustomDataIdentifierId': cdi_id or 'none',
+                              'ClassificationJobId': 'failed'
+                          })
+                  
+                  elif event['RequestType'] == 'Delete':
+                      # Cleanup - desabilitar Macie2 se necessário
+                      try:
+                          # Listar e deletar jobs
+                          jobs = macie.list_classification_jobs()
+                          for job in jobs.get('items', []):
+                              if project_name in job.get('name', ''):
+                                  try:
+                                      macie.cancel_classification_job(jobId=job['jobId'])
+                                      print(f"Job cancelado: {job['jobId']}")
+                                  except:
+                                      pass
+                          
+                          # Listar e deletar custom data identifiers
+                          cdis = macie.list_custom_data_identifiers()
+                          for cdi in cdis.get('items', []):
+                              if project_name in cdi.get('name', ''):
+                                  try:
+                                      macie.delete_custom_data_identifier(id=cdi['id'])
+                                      print(f"CDI deletado: {cdi['id']}")
+                                  except:
+                                      pass
+                          
+                          print("Cleanup do Macie2 concluído")
+                      except Exception as e:
+                          print(f"Erro durante cleanup: {str(e)}")
+                      
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  
+              except Exception as e:
+                  print(f"Erro geral: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+      
+      Role: !GetAtt MacieSetupRole.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub 
+            - '${ProjectName}-macie-setup-lambda'
+            - ProjectName: !ImportValue 
+                Fn::Sub: '${MainStackName}-ProjectName'
+        - Key: Project
+          Value: !ImportValue 
+            Fn::Sub: '${MainStackName}-ProjectName'
+
+  # Custom Resource para executar o setup do Macie
+  MacieSetup:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt MacieSetupFunction.Arn
+      ProjectName: !ImportValue 
+        Fn::Sub: '${MainStackName}-ProjectName'
+      BucketName: !ImportValue 
+        Fn::Sub: '${StorageStackName}-ComplianceBucket'
+
+  # ============================================================================
+  # SNS TOPIC PARA NOTIFICAÇÕES
+  # ============================================================================
+  
+  ComplianceAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub 
+        - '${ProjectName}-compliance-alerts'
+        - ProjectName: !ImportValue 
+            Fn::Sub: '${MainStackName}-ProjectName'
+      DisplayName: 'FSx Compliance Alerts'
+      Tags:
+        - Key: Name
+          Value: !Sub 
+            - '${ProjectName}-compliance-alerts'
+            - ProjectName: !ImportValue 
+                Fn::Sub: '${MainStackName}-ProjectName'
+        - Key: Project
+          Value: !ImportValue 
+            Fn::Sub: '${MainStackName}-ProjectName'
+
+  ComplianceAlertsSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref ComplianceAlertsTopic
+      Protocol: email
+      Endpoint: !ImportValue 
+        Fn::Sub: '${MainStackName}-NotificationEmail'
+
+  # ============================================================================
+  # EVENTBRIDGE RULE PARA PROCESSAR FINDINGS
+  # ============================================================================
+  
+  MacieFindingsRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub 
+        - '${ProjectName}-macie-findings-rule'
+        - ProjectName: !ImportValue 
+            Fn::Sub: '${MainStackName}-ProjectName'
+      Description: 'Processa findings do Macie para arquivos FSx'
+      EventPattern:
+        source: ['aws.macie']
+        detail-type: ['Macie Finding']
+        detail:
+          resourcesAffected:
+            s3Bucket:
+              name: 
+                - !ImportValue 
+                    Fn::Sub: '${StorageStackName}-ComplianceBucket'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ProcessMacieFindings.Arn
+          Id: 'ProcessMacieFindingsTarget'
+
+  # Permissão para EventBridge invocar Lambda
+  EventBridgeInvokeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ProcessMacieFindings
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt MacieFindingsRule.Arn
+
+  # ============================================================================
+  # LAMBDA PARA PROCESSAR FINDINGS
+  # ============================================================================
+  
+  ProcessMacieFindings:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 
+        - '${ProjectName}-process-findings'
+        - ProjectName: !ImportValue 
+            Fn::Sub: '${MainStackName}-ProjectName'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Timeout: 900
+      MemorySize: 512
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref ComplianceAlertsTopic
+          PROJECT_NAME: !ImportValue 
+            Fn::Sub: '${MainStackName}-ProjectName'
+          COMPLIANCE_BUCKET: !ImportValue 
+            Fn::Sub: '${StorageStackName}-ComplianceBucket'
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+          from datetime import datetime
+          
+          def lambda_handler(event, context):
+              sns = boto3.client('sns')
+              s3 = boto3.client('s3')
+              
+              print(f"Evento recebido: {json.dumps(event, default=str)}")
+              
+              finding = event['detail']
+              severity = finding.get('severity', {})
+              severity_score = severity.get('score', 0)
+              severity_description = severity.get('description', 'UNKNOWN')
+              
+              # Extrair informações do arquivo
+              resources_affected = finding.get('resourcesAffected', {})
+              s3_bucket = resources_affected.get('s3Bucket', {})
+              s3_object = resources_affected.get('s3Object', {})
+              
+              bucket_name = s3_bucket.get('name', 'unknown')
+              object_key = s3_object.get('key', 'unknown')
+              
+              # Determinar se veio do FSx
+              if object_key.startswith('fsx-sync/'):
+                  original_fsx_path = object_key.replace('fsx-sync/', '').replace('/', '\\')
+                  
+                  # Classificar ação baseada na severidade
+                  if severity_score >= 7.0:
+                      action_level = "🚨 CRÍTICO"
+                      action_description = "Ação imediata requerida"
+                  elif severity_score >= 4.0:
+                      action_level = "⚠️ MÉDIO"
+                      action_description = "Revisão necessária"
+                  else:
+                      action_level = "ℹ️ BAIXO"
+                      action_description = "Monitoramento contínuo"
+                  
+                  # Extrair detalhes do finding
+                  finding_type = finding.get('type', 'Desconhecido')
+                  description = finding.get('description', 'N/A')
+                  
+                  # Construir mensagem de alerta
+                  message = f"🔍 ALERTA DE COMPLIANCE - FSx for Windows\n\n"
+                  message += f"ℹ️ {action_level} - {action_description}\n\n"
+                  message += f"📁 Arquivo Original: {original_fsx_path}\n"
+                  message += f"📊 Severidade: {severity_description} (Score: {severity_score})\n"
+                  message += f"🏷️ Tipo de Dados: {finding_type}\n"
+                  message += f"📝 Descrição: {description}\n\n"
+                  message += f"📍 Localização S3: s3://{bucket_name}/{object_key}\n"
+                  message += f"⏰ Detectado em: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC\n\n"
+                  message += "🔧 Próximos Passos:\n"
+                  
+                  if severity_score >= 7.0:
+                      message += "• Revisar imediatamente o arquivo\n"
+                      message += "• Verificar se contém dados pessoais ou sensíveis\n"
+                      message += "• Aplicar controles de acesso restritivos\n"
+                      message += "• Considerar mover para local seguro\n"
+                      message += "• Notificar equipe de compliance\n"
+                  elif severity_score >= 4.0:
+                      message += "• Agendar revisão do arquivo\n"
+                      message += "• Verificar classificação de dados\n"
+                      message += "• Validar controles de acesso atuais\n"
+                      message += "• Documentar findings para auditoria\n"
+                  else:
+                      message += "• Incluir em relatório de monitoramento\n"
+                      message += "• Manter observação contínua\n"
+                      message += "• Revisar em próxima auditoria agendada\n"
+                  
+                  # Adicionar tags ao objeto S3 para tracking
+                  try:
+                      s3.put_object_tagging(
+                          Bucket=bucket_name,
+                          Key=object_key,
+                          Tagging={
+                              'TagSet': [
+                                  {'Key': 'ComplianceStatus', 'Value': 'FLAGGED'},
+                                  {'Key': 'SeverityLevel', 'Value': severity_description},
+                                  {'Key': 'SeverityScore', 'Value': str(severity_score)},
+                                  {'Key': 'FindingType', 'Value': finding_type},
+                                  {'Key': 'ReviewRequired', 'Value': 'true' if severity_score >= 4.0 else 'false'},
+                                  {'Key': 'DetectedAt', 'Value': datetime.utcnow().isoformat()}
+                              ]
+                          }
+                      )
+                      print(f"Tags adicionadas ao objeto: {object_key}")
+                  except Exception as e:
+                      print(f"Erro ao adicionar tags: {str(e)}")
+                  
+                  # Enviar notificação
+                  try:
+                      response = sns.publish(
+                          TopicArn=os.environ['SNS_TOPIC_ARN'],
+                          Message=message,
+                          Subject=f"{action_level} FSx Compliance Alert - {severity_description}"
+                      )
+                      print(f"Notificação enviada: {response['MessageId']}")
+                  except Exception as e:
+                      print(f"Erro ao enviar notificação: {str(e)}")
+                      
+                  # Log estruturado para CloudWatch
+                  compliance_log = {
+                      'timestamp': datetime.utcnow().isoformat(),
+                      'finding_id': finding.get('id', 'unknown'),
+                      'severity_score': severity_score,
+                      'severity_description': severity_description,
+                      'file_path': original_fsx_path,
+                      's3_location': f's3://{bucket_name}/{object_key}',
+                      'finding_type': finding_type,
+                      'action_required': severity_score >= 4.0
+                  }
+                  
+                  print(f"COMPLIANCE_LOG: {json.dumps(compliance_log)}")
+              
+              else:
+                  print(f"Finding ignorado - não é do FSx: {object_key}")
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps('Finding processado com sucesso')
+              }
+      Role: !GetAtt ProcessFindingsRole.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub 
+            - '${ProjectName}-process-findings-lambda'
+            - ProjectName: !ImportValue 
+                Fn::Sub: '${MainStackName}-ProjectName'
+        - Key: Project
+          Value: !ImportValue 
+            Fn::Sub: '${MainStackName}-ProjectName'
+
+  # Role para processar findings
+  ProcessFindingsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 
+        - '${ProjectName}-process-findings-role'
+        - ProjectName: !ImportValue 
+            Fn::Sub: '${MainStackName}-ProjectName'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ProcessFindingsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'sns:Publish'
+                Resource: !Ref ComplianceAlertsTopic
+              - Effect: Allow
+                Action:
+                  - 's3:GetObjectTagging'
+                  - 's3:PutObjectTagging'
+                Resource: !Sub 
+                  - '${BucketArn}/*'
+                  - BucketArn: !Sub 
+                      - 'arn:aws:s3:::${BucketName}'
+                      - BucketName: !ImportValue 
+                          Fn::Sub: '${StorageStackName}-ComplianceBucket'
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub 
+            - '${ProjectName}-process-findings-role'
+            - ProjectName: !ImportValue 
+                Fn::Sub: '${MainStackName}-ProjectName'
+        - Key: Project
+          Value: !ImportValue 
+            Fn::Sub: '${MainStackName}-ProjectName'
+
+Outputs:
+  MacieSessionStatus:
+    Description: 'Status da sessão do Macie'
+    Value: !GetAtt MacieSetup.MacieEnabled
+    Export:
+      Name: !Sub '${AWS::StackName}-MacieSession'
+
+  ComplianceDataIdentifierId:
+    Description: 'ID do Custom Data Identifier'
+    Value: !GetAtt MacieSetup.CustomDataIdentifierId
+    Export:
+      Name: !Sub '${AWS::StackName}-ComplianceDataIdentifier'
+
+  ClassificationJobId:
+    Description: 'ID do Classification Job'
+    Value: !GetAtt MacieSetup.ClassificationJobId
+    Export:
+      Name: !Sub '${AWS::StackName}-ClassificationJob'
+
+  ComplianceAlertsTopicArn:
+    Description: 'ARN do tópico SNS para alertas'
+    Value: !Ref ComplianceAlertsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-ComplianceAlertsTopic'
+
+  ScheduledJobId:
+    Description: 'ID do job de classificação agendado'
+    Value: !GetAtt MacieSetup.ClassificationJobId
+    Export:
+      Name: !Sub '${AWS::StackName}-ScheduledJob'

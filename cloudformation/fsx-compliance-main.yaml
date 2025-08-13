@@ -1,0 +1,380 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'FSx for Windows Compliance PoC with Amazon Macie - Main Template'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'fsx-compliance-poc'
+    Description: 'Nome do projeto para tags e recursos'
+  
+  VpcCidr:
+    Type: String
+    Default: '10.0.0.0/16'
+    Description: 'CIDR block para a VPC'
+  
+  PrivateSubnetCidr:
+    Type: String
+    Default: '10.0.1.0/24'
+    Description: 'CIDR block para subnet privada'
+  
+  PublicSubnetCidr:
+    Type: String
+    Default: '10.0.2.0/24'
+    Description: 'CIDR block para subnet pública'
+  
+  FSxStorageCapacity:
+    Type: Number
+    Default: 32
+    MinValue: 32
+    MaxValue: 65536
+    Description: 'Capacidade de armazenamento do FSx em GB'
+  
+  NotificationEmail:
+    Type: String
+    Description: 'Email para receber notificações de compliance'
+    AllowedPattern: '^[^\s@]+@[^\s@]+\.[^\s@]+$'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Configurações do Projeto"
+        Parameters:
+          - ProjectName
+          - NotificationEmail
+      - Label:
+          default: "Configurações de Rede"
+        Parameters:
+          - VpcCidr
+          - PrivateSubnetCidr
+          - PublicSubnetCidr
+      - Label:
+          default: "Configurações do FSx"
+        Parameters:
+          - FSxStorageCapacity
+
+Resources:
+  # ============================================================================
+  # NETWORKING INFRASTRUCTURE
+  # ============================================================================
+  
+  VPC:
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W60
+            reason: "This solution will not enable VPC flow logs"
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-vpc'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-igw'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnetCidr
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-public-subnet'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnetCidr
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-private-subnet'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  NATGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt EIPForNAT.AllocationId
+      SubnetId: !Ref PublicSubnet
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-nat-gateway'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  EIPForNAT:
+    Type: AWS::EC2::EIP
+    DependsOn: AttachGateway
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-nat-eip'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-public-rt'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-private-rt'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NATGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet
+      RouteTableId: !Ref PrivateRouteTable
+
+  # ============================================================================
+  # VPC ENDPOINTS
+  # ============================================================================
+  
+  S3VPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref PrivateRouteTable
+
+  LambdaVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.lambda'
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !Ref PrivateSubnet
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+
+  EventsVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.events'
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !Ref PrivateSubnet
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+
+  # VPC Endpoint para Systems Manager (necessário para Session Manager)
+  SSMVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssm'
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !Ref PrivateSubnet
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+
+  SSMMessagesVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ssmmessages'
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !Ref PrivateSubnet
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+
+  EC2MessagesVPCEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ec2messages'
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !Ref PrivateSubnet
+      SecurityGroupIds:
+        - !Ref VPCEndpointSecurityGroup
+
+  # ============================================================================
+  # SECURITY GROUPS
+  # ============================================================================
+  
+  FSxSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'Security group para FSx for Windows'
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 445
+          ToPort: 445
+          SourceSecurityGroupId: !Ref WindowsClientSecurityGroup
+          Description: 'SMB/CIFS from Windows clients'
+        - IpProtocol: tcp
+          FromPort: 135
+          ToPort: 135
+          SourceSecurityGroupId: !Ref WindowsClientSecurityGroup
+          Description: 'RPC Endpoint Mapper'
+        - IpProtocol: tcp
+          FromPort: 1024
+          ToPort: 65535
+          SourceSecurityGroupId: !Ref WindowsClientSecurityGroup
+          Description: 'Dynamic RPC ports'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-fsx-sg'
+        - Key: Project
+          Value: !Ref ProjectName
+
+  WindowsClientSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'Security group para clientes Windows (SSM only - no RDP)'
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        # Removido: RDP (porta 3389) - não é mais necessário
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: 'HTTP for downloads and updates'
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: 'HTTPS for downloads and AWS API calls'
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: 'All outbound traffic'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-windows-client-sg'
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: AccessMethod
+          Value: 'SSM Session Manager Only'
+
+  VPCEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'Security group para VPC Endpoints'
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref WindowsClientSecurityGroup
+          Description: 'HTTPS from Windows clients'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-vpc-endpoint-sg'
+        - Key: Project
+          Value: !Ref ProjectName
+
+Outputs:
+  VPCId:
+    Description: 'ID da VPC criada'
+    Value: !Ref VPC
+    Export:
+      Name: !Sub '${AWS::StackName}-VPC-ID'
+
+  PrivateSubnetId:
+    Description: 'ID da subnet privada'
+    Value: !Ref PrivateSubnet
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateSubnet-ID'
+
+  PublicSubnetId:
+    Description: 'ID da subnet pública'
+    Value: !Ref PublicSubnet
+    Export:
+      Name: !Sub '${AWS::StackName}-PublicSubnet-ID'
+
+  FSxSecurityGroupId:
+    Description: 'ID do Security Group do FSx'
+    Value: !Ref FSxSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-FSxSG-ID'
+
+  WindowsClientSecurityGroupId:
+    Description: 'ID do Security Group dos clientes Windows (SSM only)'
+    Value: !Ref WindowsClientSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-WindowsClientSG-ID'
+
+  ProjectName:
+    Description: 'Nome do projeto'
+    Value: !Ref ProjectName
+    Export:
+      Name: !Sub '${AWS::StackName}-ProjectName'
+
+  NotificationEmail:
+    Description: 'Email para notificações'
+    Value: !Ref NotificationEmail
+    Export:
+      Name: !Sub '${AWS::StackName}-NotificationEmail'
+
+  SecurityNote:
+    Description: 'Método de acesso seguro'
+    Value: 'RDP removido - Acesso apenas via AWS Systems Manager Session Manager'
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityNote'

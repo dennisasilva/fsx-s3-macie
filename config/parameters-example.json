@@ -1,0 +1,95 @@
+{
+  "Parameters": {
+    "ProjectName": "fsx-compliance-poc",
+    "NotificationEmail": "compliance@exemplo.com",
+    "VpcCidr": "10.0.0.0/16",
+    "PrivateSubnetCidr": "10.0.1.0/24",
+    "PublicSubnetCidr": "10.0.2.0/24",
+    "FSxStorageCapacity": 32,
+    "InstanceType": "t3.medium",
+    "KeyPairName": "meu-key-pair"
+  },
+  "Tags": {
+    "Environment": "PoC",
+    "Project": "FSx-Compliance",
+    "Owner": "Security-Team",
+    "CostCenter": "IT-Security",
+    "Purpose": "Compliance-Testing"
+  },
+  "Configuration": {
+    "Region": "us-east-1",
+    "EnableDetailedMonitoring": true,
+    "EnableBackups": true,
+    "BackupRetentionDays": 7,
+    "MaintenanceWindow": "sun:03:00-sun:04:00",
+    "PreferredBackupWindow": "02:00-03:00"
+  },
+  "MacieSettings": {
+    "FindingPublishingFrequency": "FIFTEEN_MINUTES",
+    "CustomKeywords": [
+      "CONFIDENCIAL",
+      "RESTRITO", 
+      "SIGILOSO",
+      "CLASSIFIED",
+      "SENHA",
+      "PASSWORD",
+      "CARTÃO DE CRÉDITO",
+      "CREDIT CARD",
+      "DADOS PESSOAIS",
+      "PERSONAL DATA"
+    ],
+    "ScanSchedule": "DAILY",
+    "ScanTime": "02:00"
+  },
+  "ComplianceRules": {
+    "HighSeverityThreshold": 7.0,
+    "MediumSeverityThreshold": 4.0,
+    "AutoQuarantineEnabled": true,
+    "ImmediateNotificationEnabled": true,
+    "SupportedFileExtensions": [
+      "pdf",
+      "doc", 
+      "docx",
+      "txt",
+      "xlsx",
+      "ppt",
+      "pptx",
+      "csv"
+    ]
+  },
+  "SyncSettings": {
+    "SyncSchedule": "0 2 * * *",
+    "MonitoringEnabled": true,
+    "RetryAttempts": 3,
+    "RetryDelay": 300,
+    "S3StorageClass": "STANDARD_IA",
+    "S3Prefix": "fsx-sync/",
+    "LogRetentionDays": 30
+  },
+  "NotificationSettings": {
+    "EmailEnabled": true,
+    "SlackEnabled": false,
+    "SMSEnabled": false,
+    "HighSeverityImmediate": true,
+    "MediumSeverityDaily": true,
+    "LowSeverityWeekly": true,
+    "SummaryReportFrequency": "WEEKLY"
+  },
+  "SecuritySettings": {
+    "EncryptionAtRest": true,
+    "EncryptionInTransit": true,
+    "VPCEndpointsEnabled": true,
+    "CloudTrailEnabled": true,
+    "GuardDutyEnabled": false,
+    "ConfigEnabled": false,
+    "AccessLoggingEnabled": true
+  },
+  "CostOptimization": {
+    "S3LifecycleEnabled": true,
+    "S3TransitionToIA": 30,
+    "S3TransitionToGlacier": 90,
+    "S3TransitionToDeepArchive": 365,
+    "EC2ScheduledStop": false,
+    "FSxBackupOptimization": true
+  }
+}

@@ -1,0 +1,631 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Windows EC2 Client para FSx Compliance PoC - SEM Key Pair (usa SSM)'
+
+Parameters:
+  MainStackName:
+    Type: String
+    Description: 'Nome da stack principal para importar valores'
+  
+  StorageStackName:
+    Type: String
+    Description: 'Nome da stack de storage para importar valores'
+  
+  InstanceType:
+    Type: String
+    Default: 't3.medium'
+    AllowedValues: ['t3.medium', 't3.large', 't3.xlarge']
+    Description: 'Tipo da instância EC2'
+
+Mappings:
+  RegionMap:
+    us-east-1:
+      AMI: ami-0758218dcb57e4a14  # Windows Server 2022 Full Base (com SSM Agent + Interface Gráfica)
+    us-west-2:
+      AMI: ami-0312c9e5e6b4d1e5c  # Windows Server 2022 Full Base (com SSM Agent + Interface Gráfica)
+    eu-west-1:
+      AMI: ami-0d75513e7706cf2d9  # Windows Server 2022 Full Base (com SSM Agent + Interface Gráfica)
+
+Resources:
+  # ============================================================================
+  # WINDOWS EC2 INSTANCE (SEM KEY PAIR)
+  # ============================================================================
+  
+  WindowsClientInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !FindInMap [RegionMap, !Ref 'AWS::Region', AMI]
+      InstanceType: !Ref InstanceType
+      # KeyName removido - usando SSM Session Manager
+      SubnetId: !ImportValue 
+        Fn::Sub: '${MainStackName}-PrivateSubnet-ID'
+      SecurityGroupIds:
+        - !ImportValue 
+            Fn::Sub: '${MainStackName}-WindowsClientSG-ID'
+      IamInstanceProfile: !Ref WindowsInstanceProfile
+      UserData:
+        Fn::Base64: !Sub |
+          <powershell>
+          # Log de inicialização
+          Start-Transcript -Path "C:\Windows\Temp\userdata.log"
+          
+          Write-Host "=== FSx Compliance PoC - Configuração Automatizada ==="
+          Write-Host "Instância configurada para funcionar SEM acesso RDP"
+          Write-Host "Use AWS Systems Manager Session Manager para acesso se necessário"
+          
+          # Definir variáveis do projeto
+          $projectName = "${MainStackName}"
+          
+          # ============================================================================
+          # VERIFICAR E CONFIGURAR SSM AGENT (JÁ PRÉ-INSTALADO NA AMI)
+          # ============================================================================
+          Write-Host "🔧 Verificando SSM Agent (pré-instalado na AMI)..."
+          
+          try {
+              # Verificar se o serviço existe e está rodando
+              $ssmService = Get-Service -Name "AmazonSSMAgent" -ErrorAction Stop
+              Write-Host "✅ SSM Agent encontrado: $($ssmService.Status)"
+              
+              # Garantir que está rodando e configurado para iniciar automaticamente
+              if ($ssmService.Status -ne "Running") {
+                  Start-Service -Name "AmazonSSMAgent"
+                  Write-Host "✅ SSM Agent iniciado"
+              }
+              
+              Set-Service -Name "AmazonSSMAgent" -StartupType Automatic
+              Write-Host "✅ SSM Agent configurado para inicialização automática"
+              
+              # Aguardar alguns segundos para o serviço estabilizar
+              Start-Sleep -Seconds 10
+              
+              # Verificar status final
+              $finalStatus = Get-Service -Name "AmazonSSMAgent"
+              Write-Host "📊 Status final do SSM Agent: $($finalStatus.Status)"
+              
+          } catch {
+              Write-Host "❌ Erro ao configurar SSM Agent: $($_.Exception.Message)"
+              Write-Host "⚠️ Tentando reinstalar SSM Agent como fallback..."
+              
+              # Fallback: instalar SSM Agent se houver problema
+              try {
+                  $ssmUrl = "https://s3.amazonaws.com/ec2-downloads-windows/SSMAgent/latest/windows_amd64/AmazonSSMAgentSetup.exe"
+                  Invoke-WebRequest -Uri $ssmUrl -OutFile "C:\Windows\Temp\AmazonSSMAgentSetup.exe"
+                  Start-Process -FilePath "C:\Windows\Temp\AmazonSSMAgentSetup.exe" -ArgumentList "/S" -Wait
+                  Start-Service -Name "AmazonSSMAgent"
+                  Set-Service -Name "AmazonSSMAgent" -StartupType Automatic
+                  Write-Host "✅ SSM Agent reinstalado com sucesso"
+              } catch {
+                  Write-Host "❌ Falha na reinstalação do SSM Agent: $($_.Exception.Message)"
+              }
+          }
+          
+          # ============================================================================
+          # INSTALAR AWS CLI
+          # ============================================================================
+          Write-Host "📥 Instalando AWS CLI..."
+          $ProgressPreference = 'SilentlyContinue'
+          try {
+              Invoke-WebRequest -Uri "https://awscli.amazonaws.com/AWSCLIV2.msi" -OutFile "C:\Windows\Temp\AWSCLIV2.msi"
+              Start-Process msiexec.exe -Wait -ArgumentList '/I C:\Windows\Temp\AWSCLIV2.msi /quiet'
+              Write-Host "✅ AWS CLI instalado com sucesso"
+          } catch {
+              Write-Host "❌ Erro ao instalar AWS CLI: $($_.Exception.Message)"
+          }
+          
+          # Adicionar AWS CLI ao PATH
+          $env:PATH += ";C:\Program Files\Amazon\AWSCLIV2"
+          [Environment]::SetEnvironmentVariable("PATH", $env:PATH, [EnvironmentVariableTarget]::Machine)
+          
+          # Instalar AWS Tools for PowerShell
+          Write-Host "📥 Instalando AWS Tools for PowerShell..."
+          try {
+              Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force
+              Install-Module -Name AWS.Tools.Installer -Force -AllowClobber
+              Install-AWSToolsModule AWS.Tools.S3,AWS.Tools.FSx,AWS.Tools.DirectoryService -Force
+              Write-Host "✅ AWS Tools for PowerShell instalado com sucesso"
+          } catch {
+              Write-Host "❌ Erro ao instalar AWS Tools: $($_.Exception.Message)"
+          }
+          
+          # ============================================================================
+          # INGRESSAR NO DOMÍNIO MANAGED AD (CRÍTICO PARA FSX)
+          # ============================================================================
+          Write-Host "🔐 Configurando ingresso no domínio Managed AD..."
+          
+          try {
+              # Obter informações do Managed AD
+              $managedADId = "${StorageStackName}-ManagedAD"
+              Write-Host "📋 Obtendo informações do Managed AD: $managedADId"
+              
+              # Aguardar Managed AD ficar disponível
+              $maxAttempts = 20
+              $attempt = 0
+              $adReady = $false
+              
+              do {
+                  $attempt++
+                  try {
+                      $adInfo = aws ds describe-directories --directory-ids $managedADId --region ${AWS::Region} --output json | ConvertFrom-Json
+                      if ($adInfo -and $adInfo.DirectoryDescriptions -and $adInfo.DirectoryDescriptions[0].Stage -eq "Active") {
+                          $domainName = $adInfo.DirectoryDescriptions[0].Name
+                          $dnsIpAddrs = $adInfo.DirectoryDescriptions[0].DnsIpAddrs
+                          Write-Host "✅ Managed AD disponível: $domainName"
+                          Write-Host "📡 DNS IPs: $($dnsIpAddrs -join ', ')"
+                          $adReady = $true
+                      } else {
+                          Write-Host "⏳ Tentativa $attempt/$maxAttempts - Managed AD ainda não disponível"
+                          Start-Sleep -Seconds 60
+                      }
+                  } catch {
+                      Write-Host "⚠️ Erro ao verificar Managed AD (tentativa $attempt): $($_.Exception.Message)"
+                      Start-Sleep -Seconds 60
+                  }
+              } while (-not $adReady -and $attempt -lt $maxAttempts)
+              
+              if ($adReady) {
+                  # Configurar DNS para apontar para o Managed AD
+                  Write-Host "🔧 Configurando DNS para Managed AD..."
+                  $adapter = Get-NetAdapter | Where-Object {$_.Status -eq "Up"} | Select-Object -First 1
+                  Set-DnsClientServerAddress -InterfaceAlias $adapter.Name -ServerAddresses $dnsIpAddrs
+                  Write-Host "✅ DNS configurado para Managed AD"
+                  
+                  # Aguardar propagação DNS
+                  Write-Host "⏳ Aguardando propagação DNS..."
+                  Start-Sleep -Seconds 30
+                  
+                  # Obter credenciais do domínio (usando a senha gerada)
+                  $domainUser = "Admin"
+                  
+                  # Tentar obter a senha do Systems Manager Parameter Store
+                  try {
+                      $passwordParam = aws ssm get-parameter --name "${StorageStackName}-ADPassword" --with-decryption --region ${AWS::Region} --output text --query 'Parameter.Value'
+                      if ($passwordParam) {
+                          $securePassword = ConvertTo-SecureString $passwordParam -AsPlainText -Force
+                          $credential = New-Object System.Management.Automation.PSCredential("$domainName\$domainUser", $securePassword)
+                          
+                          # Ingressar no domínio
+                          Write-Host "🔗 Ingressando no domínio: $domainName"
+                          Add-Computer -DomainName $domainName -Credential $credential -Restart -Force
+                          Write-Host "✅ Ingresso no domínio iniciado - instância será reiniciada"
+                      } else {
+                          Write-Host "❌ Não foi possível obter a senha do domínio"
+                      }
+                  } catch {
+                      Write-Host "❌ Erro ao ingressar no domínio: $($_.Exception.Message)"
+                      Write-Host "⚠️ Será necessário ingressar manualmente no domínio para acessar FSx"
+                  }
+              } else {
+                  Write-Host "❌ Managed AD não ficou disponível no tempo esperado"
+                  Write-Host "⚠️ Será necessário ingressar manualmente no domínio para acessar FSx"
+              }
+          } catch {
+              Write-Host "❌ Erro na configuração do domínio: $($_.Exception.Message)"
+              Write-Host "⚠️ Será necessário ingressar manualmente no domínio para acessar FSx"
+          }
+          
+          # Criar diretório para scripts
+          New-Item -ItemType Directory -Path "C:\FSxCompliance" -Force
+          Write-Host "📁 Diretório C:\FSxCompliance criado"
+          
+          # Aguardar FSx ficar disponível
+          Write-Host "⏳ Aguardando FSx ficar disponível..."
+          $maxAttempts = 30
+          $attempt = 0
+          $fsxReady = $false
+          
+          do {
+              $attempt++
+              try {
+                  $fsxInfo = aws fsx describe-file-systems --region ${AWS::Region} --query "FileSystems[?Tags[?Key==``Project`` && Value==``$projectName``]]" --output json | ConvertFrom-Json
+                  if ($fsxInfo -and $fsxInfo.Count -gt 0 -and $fsxInfo[0].Lifecycle -eq "AVAILABLE") {
+                      $fsxDns = $fsxInfo[0].DNSName
+                      Write-Host "✅ FSx disponível: $fsxDns"
+                      $fsxReady = $true
+                  } else {
+                      Write-Host "⏳ Tentativa $attempt/$maxAttempts - FSx ainda não disponível"
+                      Start-Sleep -Seconds 60
+                  }
+              } catch {
+                  Write-Host "⏳ Tentativa $attempt/$maxAttempts - Verificando FSx..."
+                  Start-Sleep -Seconds 60
+              }
+          } while (-not $fsxReady -and $attempt -lt $maxAttempts)
+          
+          if ($fsxReady) {
+              # Tentar montar FSx automaticamente
+              Write-Host "🔗 Tentando montar FSx como drive Z:..."
+              try {
+                  # Usar credenciais do domínio (se disponível)
+                  net use Z: "\\$fsxDns\share" /persistent:yes
+                  if ($LASTEXITCODE -eq 0) {
+                      Write-Host "✅ FSx montado com sucesso como Z:"
+                      
+                      # Criar diretório de teste
+                      New-Item -ItemType Directory -Path "Z:\ComplianceDocs" -Force
+                      Write-Host "📁 Diretório Z:\ComplianceDocs criado"
+                  } else {
+                      Write-Host "⚠️ Não foi possível montar FSx automaticamente"
+                      Write-Host "   Use Session Manager para conectar e montar manualmente:"
+                      Write-Host "   net use Z: \\$fsxDns\share"
+                  }
+              } catch {
+                  Write-Host "⚠️ Erro ao montar FSx: $($_.Exception.Message)"
+              }
+          } else {
+              Write-Host "❌ FSx não ficou disponível no tempo esperado"
+          }
+          
+          # Script de sincronização FSx -> S3 (AUTOMATIZADO)
+          $syncScript = @'
+          # Script de Sincronização FSx para S3 - AUTOMATIZADO
+          param(
+              [string]$FSxPath = "Z:\ComplianceDocs",
+              [string]$S3Bucket = "${StorageStackName}-ComplianceBucket",
+              [string]$S3Prefix = "fsx-sync/"
+          )
+          
+          $logFile = "C:\FSxCompliance\sync-$(Get-Date -Format 'yyyyMMdd-HHmmss').log"
+          
+          function Write-Log {
+              param([string]$Message)
+              $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+              "$timestamp - $Message" | Out-File -FilePath $logFile -Append
+              Write-Host "$timestamp - $Message"
+          }
+          
+          Write-Log "=== SINCRONIZAÇÃO AUTOMATIZADA FSx -> S3 ==="
+          Write-Log "FSx Path: $FSxPath"
+          Write-Log "S3 Bucket: $S3Bucket"
+          
+          # Verificar se o diretório FSx existe
+          if (!(Test-Path $FSxPath)) {
+              Write-Log "⚠️ Diretório FSx não encontrado: $FSxPath"
+              Write-Log "   Criando diretório..."
+              try {
+                  New-Item -ItemType Directory -Path $FSxPath -Force
+                  Write-Log "✅ Diretório criado: $FSxPath"
+              } catch {
+                  Write-Log "❌ Erro ao criar diretório: $($_.Exception.Message)"
+                  exit 1
+              }
+          }
+          
+          # Extensões de arquivo para sincronizar
+          $extensions = @("*.pdf", "*.doc", "*.docx", "*.txt", "*.xlsx", "*.ppt", "*.pptx")
+          $totalFiles = 0
+          $successFiles = 0
+          
+          foreach ($extension in $extensions) {
+              Write-Log "🔍 Processando arquivos: $extension"
+              
+              $files = Get-ChildItem -Path $FSxPath -Filter $extension -Recurse -File -ErrorAction SilentlyContinue
+              
+              foreach ($file in $files) {
+                  $totalFiles++
+                  try {
+                      $relativePath = $file.FullName.Substring($FSxPath.Length + 1)
+                      $s3Key = "$S3Prefix$relativePath" -replace "\\", "/"
+                      
+                      Write-Log "📤 Sincronizando: $($file.Name) -> $s3Key"
+                      
+                      # Upload para S3 com metadados
+                      aws s3 cp $file.FullName "s3://$S3Bucket/$s3Key" `
+                          --metadata "source=fsx,original-path=$($file.FullName),file-size=$($file.Length),last-modified=$($file.LastWriteTime.ToString('yyyy-MM-ddTHH:mm:ssZ')),sync-type=automated" `
+                          --storage-class STANDARD_IA `
+                          --no-progress `
+                          --region ${AWS::Region}
+                      
+                      if ($LASTEXITCODE -eq 0) {
+                          Write-Log "✅ Sucesso: $($file.Name)"
+                          $successFiles++
+                      } else {
+                          Write-Log "❌ Erro no upload: $($file.Name)"
+                      }
+                  }
+                  catch {
+                      Write-Log "❌ Exceção ao processar $($file.Name): $($_.Exception.Message)"
+                  }
+              }
+          }
+          
+          Write-Log "=== RESUMO DA SINCRONIZAÇÃO ==="
+          Write-Log "Total de arquivos processados: $totalFiles"
+          Write-Log "Arquivos sincronizados com sucesso: $successFiles"
+          Write-Log "Taxa de sucesso: $(if($totalFiles -gt 0){[math]::Round(($successFiles/$totalFiles)*100,2)}else{0})%"
+          Write-Log "Sincronização concluída"
+          '@
+          
+          $syncScript | Out-File -FilePath "C:\FSxCompliance\sync-fsx-to-s3.ps1" -Encoding UTF8
+          Write-Host "📜 Script de sincronização criado"
+          
+          # Script para criar arquivos de teste AUTOMATICAMENTE
+          $testScript = @'
+          # Script para criar arquivos de teste - EXECUÇÃO AUTOMÁTICA
+          param(
+              [string]$TestPath = "Z:\ComplianceDocs\TestFiles"
+          )
+          
+          Write-Host "=== CRIANDO ARQUIVOS DE TESTE AUTOMATICAMENTE ==="
+          
+          # Criar diretório de teste
+          try {
+              New-Item -ItemType Directory -Path $TestPath -Force
+              Write-Host "✅ Diretório de teste criado: $TestPath"
+          } catch {
+              Write-Host "❌ Erro ao criar diretório de teste: $($_.Exception.Message)"
+              return
+          }
+          
+          # Arquivo com dados sensíveis (simulado)
+          $sensitiveContent = @"
+          DOCUMENTO CONFIDENCIAL - TESTE AUTOMATIZADO
+          
+          Este documento foi criado automaticamente para testar a detecção de dados sensíveis.
+          
+          Dados pessoais de exemplo (FICTÍCIOS):
+          - CPF: 123.456.789-00
+          - Email: teste@exemplo.com
+          - Telefone: (11) 99999-9999
+          - Cartão de Crédito: 4111-1111-1111-1111
+          
+          RESTRITO - Documento de teste para compliance
+          Criado em: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+          "@
+          
+          try {
+              $sensitiveContent | Out-File -FilePath "$TestPath\documento_confidencial_teste.txt" -Encoding UTF8
+              Write-Host "✅ Arquivo sensível criado: documento_confidencial_teste.txt"
+          } catch {
+              Write-Host "❌ Erro ao criar arquivo sensível: $($_.Exception.Message)"
+          }
+          
+          # Arquivo normal (sem dados sensíveis)
+          $normalContent = @"
+          Manual do Usuário - Teste Automatizado
+          
+          Este é um documento público com informações gerais para teste.
+          
+          Instruções de uso:
+          1. Abrir o sistema
+          2. Fazer login
+          3. Navegar pelos menus
+          4. Executar operações
+          
+          Suporte: suporte@empresa.com
+          Versão: 1.0
+          Criado em: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+          "@
+          
+          try {
+              $normalContent | Out-File -FilePath "$TestPath\manual_usuario_teste.txt" -Encoding UTF8
+              Write-Host "✅ Arquivo normal criado: manual_usuario_teste.txt"
+          } catch {
+              Write-Host "❌ Erro ao criar arquivo normal: $($_.Exception.Message)"
+          }
+          
+          # Arquivo com palavra-chave específica
+          $keywordContent = @"
+          Relatório de Vendas - SIGILOSO
+          
+          Este relatório contém informações CONFIDENCIAIS sobre vendas.
+          
+          Dados do trimestre:
+          - Vendas totais: R$ 1.000.000
+          - Clientes ativos: 500
+          - Margem de lucro: 25%
+          
+          Classificação: RESTRITO
+          Acesso limitado apenas à diretoria
+          Criado em: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+          "@
+          
+          try {
+              $keywordContent | Out-File -FilePath "$TestPath\relatorio_sigiloso_teste.txt" -Encoding UTF8
+              Write-Host "✅ Arquivo com palavras-chave criado: relatorio_sigiloso_teste.txt"
+          } catch {
+              Write-Host "❌ Erro ao criar arquivo com palavras-chave: $($_.Exception.Message)"
+          }
+          
+          Write-Host "=== ARQUIVOS DE TESTE CRIADOS COM SUCESSO ==="
+          Write-Host "Localização: $TestPath"
+          Write-Host "Total: 3 arquivos (1 sensível, 1 normal, 1 com palavras-chave)"
+          '@
+          
+          $testScript | Out-File -FilePath "C:\FSxCompliance\create-test-files.ps1" -Encoding UTF8
+          Write-Host "📜 Script de teste criado"
+          
+          # Executar criação de arquivos de teste AUTOMATICAMENTE
+          if (Test-Path "Z:\ComplianceDocs") {
+              Write-Host "🧪 Executando criação de arquivos de teste..."
+              try {
+                  & "C:\FSxCompliance\create-test-files.ps1"
+                  Write-Host "✅ Arquivos de teste criados automaticamente"
+              } catch {
+                  Write-Host "❌ Erro ao criar arquivos de teste: $($_.Exception.Message)"
+              }
+          }
+          
+          # Executar sincronização inicial AUTOMATICAMENTE
+          Write-Host "🔄 Executando sincronização inicial..."
+          try {
+              & "C:\FSxCompliance\sync-fsx-to-s3.ps1"
+              Write-Host "✅ Sincronização inicial executada"
+          } catch {
+              Write-Host "❌ Erro na sincronização inicial: $($_.Exception.Message)"
+          }
+          
+          # Criar tarefa agendada para sincronização automática
+          Write-Host "⏰ Configurando sincronização automática..."
+          try {
+              $action = New-ScheduledTaskAction -Execute "PowerShell.exe" -Argument "-File C:\FSxCompliance\sync-fsx-to-s3.ps1"
+              $trigger = New-ScheduledTaskTrigger -Daily -At "02:00AM"
+              $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
+              
+              Register-ScheduledTask -TaskName "FSxComplianceSync" -Action $action -Trigger $trigger -Settings $settings -Description "Sincronização diária FSx para S3" -Force
+              Write-Host "✅ Tarefa agendada criada: FSxComplianceSync (diária às 02:00)"
+          } catch {
+              Write-Host "❌ Erro ao criar tarefa agendada: $($_.Exception.Message)"
+          }
+          
+          Write-Host ""
+          Write-Host "=== CONFIGURAÇÃO AUTOMATIZADA CONCLUÍDA ==="
+          Write-Host "✅ AWS CLI instalado"
+          Write-Host "✅ AWS Tools for PowerShell instalado"
+          Write-Host "✅ Scripts de sincronização criados"
+          Write-Host "✅ Arquivos de teste criados (se FSx disponível)"
+          Write-Host "✅ Sincronização inicial executada"
+          Write-Host "✅ Tarefa agendada configurada"
+          Write-Host ""
+          Write-Host "📍 PRÓXIMOS PASSOS:"
+          Write-Host "1. Aguarde alguns minutos para o Macie processar os arquivos"
+          Write-Host "2. Verifique o email configurado para alertas de compliance"
+          Write-Host "3. Use AWS Systems Manager Session Manager se precisar acessar a instância"
+          Write-Host "4. Monitore os logs em C:\FSxCompliance\"
+          Write-Host ""
+          Write-Host "🔍 MONITORAMENTO:"
+          Write-Host "- S3 Bucket: ${StorageStackName}-ComplianceBucket"
+          Write-Host "- Macie Console: https://console.aws.amazon.com/macie/"
+          Write-Host "- CloudWatch Logs: /aws/lambda/fsx-compliance-poc-*"
+          Write-Host ""
+          
+          Stop-Transcript
+          </powershell>
+      Tags:
+        - Key: Name
+          Value: !Sub 
+            - '${ProjectName}-windows-client-automated'
+            - ProjectName: !ImportValue 
+                Fn::Sub: '${MainStackName}-ProjectName'
+        - Key: Project
+          Value: !ImportValue 
+            Fn::Sub: '${MainStackName}-ProjectName'
+        - Key: Purpose
+          Value: 'FSx Compliance Client - Automated'
+        - Key: AccessMethod
+          Value: 'SSM Session Manager'
+
+  # ============================================================================
+  # IAM ROLE PARA EC2 (COM SSM)
+  # ============================================================================
+  
+  WindowsInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 
+        - '${ProjectName}-windows-instance-role-ssm'
+        - ProjectName: !ImportValue 
+            Fn::Sub: '${MainStackName}-ProjectName'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore  # Para Session Manager
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy   # Para CloudWatch
+      Policies:
+        - PolicyName: FSxCompliancePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:PutObject'
+                  - 's3:PutObjectAcl'
+                  - 's3:GetObject'
+                  - 's3:ListBucket'
+                  - 's3:ListBuckets'
+                Resource: 
+                  - !Sub 
+                    - '${BucketArn}'
+                    - BucketArn: !Sub 
+                        - 'arn:aws:s3:::${BucketName}'
+                        - BucketName: !ImportValue 
+                            Fn::Sub: '${StorageStackName}-ComplianceBucket'
+                  - !Sub 
+                    - '${BucketArn}/*'
+                    - BucketArn: !Sub 
+                        - 'arn:aws:s3:::${BucketName}'
+                        - BucketName: !ImportValue 
+                            Fn::Sub: '${StorageStackName}-ComplianceBucket'
+              - Effect: Allow
+                Action:
+                  - 's3:ListAllMyBuckets'
+                  - 's3:GetBucketLocation'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'fsx:DescribeFileSystems'
+                  - 'fsx:DescribeBackups'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'ds:DescribeDirectories'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                  - 'logs:DescribeLogStreams'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'macie2:GetMacieSession'
+                  - 'macie2:ListFindings'
+                  - 'macie2:GetFindings'
+                  - 'macie2:ListClassificationJobs'
+                  - 'macie2:DescribeClassificationJob'
+                  - 'macie2:CreateClassificationJob'
+                  - 'macie2:ListCustomDataIdentifiers'
+                  - 'macie2:GetCustomDataIdentifier'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'sts:GetCallerIdentity'
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub 
+            - '${ProjectName}-windows-instance-role-ssm'
+            - ProjectName: !ImportValue 
+                Fn::Sub: '${MainStackName}-ProjectName'
+        - Key: Project
+          Value: !ImportValue 
+            Fn::Sub: '${MainStackName}-ProjectName'
+
+  WindowsInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub 
+        - '${ProjectName}-windows-instance-profile-ssm'
+        - ProjectName: !ImportValue 
+            Fn::Sub: '${MainStackName}-ProjectName'
+      Roles:
+        - !Ref WindowsInstanceRole
+
+Outputs:
+  WindowsInstanceId:
+    Description: 'ID da instância Windows EC2 (sem key-pair)'
+    Value: !Ref WindowsClientInstance
+    Export:
+      Name: !Sub '${AWS::StackName}-WindowsInstance'
+
+  WindowsInstancePrivateIP:
+    Description: 'IP privado da instância Windows'
+    Value: !GetAtt WindowsClientInstance.PrivateIp
+    Export:
+      Name: !Sub '${AWS::StackName}-WindowsInstanceIP'
+
+  AccessMethod:
+    Description: 'Método de acesso à instância'
+    Value: 'AWS Systems Manager Session Manager'
+    Export:
+      Name: !Sub '${AWS::StackName}-AccessMethod'
+
+  SSMSessionCommand:
+    Description: 'Comando para conectar via SSM'
+    Value: !Sub 'aws ssm start-session --target ${WindowsClientInstance} --region ${AWS::Region}'
+    Export:
+      Name: !Sub '${AWS::StackName}-SSMCommand'
