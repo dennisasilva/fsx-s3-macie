@@ -5,26 +5,100 @@ mkdir -p /tmp/compliance-test && cd /tmp/compliance-test && cat > test.sh << 'EO
 #!/bin/bash
 
 # FSx Compliance Test - Linux Version
+# ----------------------------------------------------------------------------
+# Pré-parse de --bucket / --project / --stack / --yes para resolver o bucket
+# autoritativamente (via output da stack CloudFormation + tag Project) em vez
+# de uma busca por substring de nome, que casaria qualquer bucket cujo nome
+# contenha 'compliance' na conta.
+# ----------------------------------------------------------------------------
+BUCKET_NAME="${BUCKET_NAME:-}"
+_CLI_PROJECT_NAME=""
+_CLI_STACK_NAME=""
+_CLI_CONFIRM=""
+_POS=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --bucket)        BUCKET_NAME="${2:-}"; shift 2 ;;
+        --bucket=*)      BUCKET_NAME="${1#*=}"; shift ;;
+        --project)       _CLI_PROJECT_NAME="${2:-}"; shift 2 ;;
+        --project=*)     _CLI_PROJECT_NAME="${1#*=}"; shift ;;
+        --stack)         _CLI_STACK_NAME="${2:-}"; shift 2 ;;
+        --stack=*)       _CLI_STACK_NAME="${1#*=}"; shift ;;
+        --yes|-y)        _CLI_CONFIRM="1"; shift ;;
+        --)              shift; while [ $# -gt 0 ]; do _POS+=("$1"); shift; done ;;
+        *)               _POS+=("$1"); shift ;;
+    esac
+done
+set -- "${_POS[@]}"
+
 NUM_FILES=${1:-3}
 ACTION=${2:-"test"}
+AWS_REGION="${AWS_REGION:-us-east-1}"
+PROJECT_NAME="${_CLI_PROJECT_NAME:-${PROJECT_NAME:-fsx-compliance-poc}}"
+STORAGE_STACK_NAME="${_CLI_STACK_NAME:-${STORAGE_STACK_NAME:-${PROJECT_NAME}-storage}}"
+CONFIRM="${_CLI_CONFIRM:-${CONFIRM:-}}"
 
 echo "=== FSx COMPLIANCE TEST - LINUX ==="
 echo "Teste de detecção de dados sensíveis"
 echo ""
 
-# Função para encontrar bucket
+# Função para encontrar bucket (resolução autoritativa via stack output + tag)
 find_bucket() {
-    echo "🔍 Procurando bucket de compliance..."
-    BUCKET=$(aws s3api list-buckets --query "Buckets[?contains(Name, 'compliance')].Name" --output text 2>/dev/null | head -1)
-    if [ -n "$BUCKET" ]; then
-        echo "✅ Bucket encontrado: $BUCKET"
-        return 0
+    echo "🔍 Resolvendo bucket de compliance a partir da stack ${STORAGE_STACK_NAME}..."
+    if [ -n "$BUCKET_NAME" ]; then
+        BUCKET="$BUCKET_NAME"
+        echo "ℹ️  Usando bucket informado pelo operador: $BUCKET"
     else
-        echo "❌ Bucket não encontrado automaticamente"
-        echo "Buckets disponíveis:"
-        aws s3 ls
+        BUCKET=$(aws cloudformation describe-stacks \
+            --stack-name "$STORAGE_STACK_NAME" \
+            --region "$AWS_REGION" \
+            --query 'Stacks[0].Outputs[?OutputKey==`ComplianceBucketName`].OutputValue' \
+            --output text 2>/dev/null)
+        if [ -z "$BUCKET" ] || [ "$BUCKET" = "None" ]; then
+            echo "❌ Não foi possível resolver o bucket a partir da stack $STORAGE_STACK_NAME"
+            echo "   Passe --bucket <nome> ou defina BUCKET_NAME para resolver manualmente."
+            return 1
+        fi
+        # --output text separa múltiplos valores com tab; recusar ambiguidade.
+        local count
+        count=$(printf '%s' "$BUCKET" | tr '\t' '\n' | grep -c .)
+        if [ "$count" -ne 1 ]; then
+            echo "❌ Stack $STORAGE_STACK_NAME retornou $count valores para ComplianceBucketName; abortando"
+            return 1
+        fi
+    fi
+
+    # Verificar tag Project do bucket resolvido.
+    local tags project_tag
+    tags=$(aws s3api get-bucket-tagging --bucket "$BUCKET" --output json 2>/dev/null) || {
+        echo "❌ Não foi possível ler as tags do bucket $BUCKET; abortando"
+        return 1
+    }
+    project_tag=$(printf '%s' "$tags" | jq -r '.TagSet[]? | select(.Key=="Project") | .Value' 2>/dev/null)
+    if [ "$project_tag" != "$PROJECT_NAME" ]; then
+        echo "❌ Bucket $BUCKET não possui tag Project=$PROJECT_NAME (valor atual: '${project_tag:-<ausente>}'); abortando"
         return 1
     fi
+
+    # Ecoa o nome e exige confirmação antes de qualquer s3 cp / rm /
+    # macie2 create-classification-job.
+    echo "⚠️  Bucket alvo resolvido: $BUCKET (projeto: $PROJECT_NAME)"
+    if [ "$CONFIRM" = "1" ] || [ "$CONFIRM" = "yes" ] || [ "$CONFIRM" = "y" ]; then
+        echo "✅ CONFIRM=$CONFIRM; prosseguindo"
+    else
+        if [ ! -t 0 ]; then
+            echo "❌ Entrada não interativa e CONFIRM não setado; abortando"
+            return 1
+        fi
+        local reply
+        read -r -p "Digite 'yes' para operar neste bucket: " reply
+        if [ "$reply" != "yes" ]; then
+            echo "❌ Confirmação negada; abortando"
+            return 1
+        fi
+    fi
+    echo "✅ Bucket confirmado: $BUCKET"
+    return 0
 }
 
 # Monitorar findings

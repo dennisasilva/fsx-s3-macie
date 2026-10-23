@@ -31,12 +31,39 @@ fi
 cat > compliance-test.sh << 'SCRIPT_EOF'
 #!/bin/bash
 
+# ----------------------------------------------------------------------------
+# Pré-parse de --bucket / --project / --stack / --yes (ver remediação do
+# finding: resolver o bucket autoritativamente, nunca por substring).
+# ----------------------------------------------------------------------------
+BUCKET_NAME="${BUCKET_NAME:-}"
+_CLI_PROJECT_NAME=""
+_CLI_STACK_NAME=""
+_CLI_CONFIRM=""
+_POS=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --bucket)        BUCKET_NAME="${2:-}"; shift 2 ;;
+        --bucket=*)      BUCKET_NAME="${1#*=}"; shift ;;
+        --project)       _CLI_PROJECT_NAME="${2:-}"; shift 2 ;;
+        --project=*)     _CLI_PROJECT_NAME="${1#*=}"; shift ;;
+        --stack)         _CLI_STACK_NAME="${2:-}"; shift 2 ;;
+        --stack=*)       _CLI_STACK_NAME="${1#*=}"; shift ;;
+        --yes|-y)        _CLI_CONFIRM="1"; shift ;;
+        --)              shift; while [ $# -gt 0 ]; do _POS+=("$1"); shift; done ;;
+        *)               _POS+=("$1"); shift ;;
+    esac
+done
+set -- "${_POS[@]}"
+
 # Configurações
 NUM_FILES=${1:-3}
 ACTION=${2:-"test"}
 AWS_REGION=${AWS_REGION:-"us-east-1"}
 TEST_DIR="/tmp/fsx-compliance-test"
 DATA_DIR="$TEST_DIR/test-data"
+PROJECT_NAME="${_CLI_PROJECT_NAME:-${PROJECT_NAME:-fsx-compliance-poc}}"
+STORAGE_STACK_NAME="${_CLI_STACK_NAME:-${STORAGE_STACK_NAME:-${PROJECT_NAME}-storage}}"
+CONFIRM="${_CLI_CONFIRM:-${CONFIRM:-}}"
 
 # Cores
 RED='\033[0;31m'
@@ -57,21 +84,96 @@ print_header() {
     echo ""
 }
 
-find_compliance_bucket() {
-    log_info "Identificando bucket S3 de compliance..."
-    
-    local buckets=$(aws s3api list-buckets --query "Buckets[?contains(Name, 'compliance')].Name" --output text 2>/dev/null)
-    
-    if [ -n "$buckets" ]; then
-        COMPLIANCE_BUCKET=$(echo "$buckets" | head -1)
-        log_success "Bucket encontrado: $COMPLIANCE_BUCKET"
-        return 0
-    else
-        log_warning "Bucket de compliance não encontrado automaticamente"
-        echo "Buckets disponíveis:"
-        aws s3 ls
+resolve_bucket_from_stack() {
+    local stack_name="$1"
+    local value
+    value=$(aws cloudformation describe-stacks \
+        --stack-name "$stack_name" \
+        --region "$AWS_REGION" \
+        --query 'Stacks[0].Outputs[?OutputKey==`ComplianceBucketName`].OutputValue' \
+        --output text 2>/dev/null)
+    if [ -z "$value" ] || [ "$value" = "None" ]; then
         return 1
     fi
+    local count
+    count=$(printf '%s' "$value" | tr '\t' '\n' | grep -c .)
+    if [ "$count" -ne 1 ]; then
+        log_error "Stack $stack_name retornou $count valores para ComplianceBucketName"
+        return 2
+    fi
+    printf '%s' "$value"
+}
+
+verify_bucket_ownership() {
+    local bucket="$1"
+    local tags project_tag
+    tags=$(aws s3api get-bucket-tagging --bucket "$bucket" --output json 2>/dev/null) || {
+        log_error "Não foi possível ler as tags do bucket $bucket (inexistente ou sem permissão)"
+        return 1
+    }
+    project_tag=$(printf '%s' "$tags" | jq -r '.TagSet[]? | select(.Key=="Project") | .Value' 2>/dev/null)
+    if [ -z "$project_tag" ]; then
+        log_error "Bucket $bucket não possui a tag Project; recusando operar nele"
+        return 1
+    fi
+    if [ "$project_tag" != "$PROJECT_NAME" ]; then
+        log_error "Bucket $bucket pertence ao projeto '$project_tag', esperado '$PROJECT_NAME'"
+        return 1
+    fi
+    return 0
+}
+
+confirm_bucket() {
+    local bucket="$1"
+    echo ""
+    echo -e "${YELLOW}>>> Bucket alvo resolvido: ${bucket}${NC}"
+    echo -e "${YELLOW}>>> Projeto esperado   : ${PROJECT_NAME}${NC}"
+    echo -e "${YELLOW}>>> Stack de origem    : ${STORAGE_STACK_NAME}${NC}"
+    if [ "$CONFIRM" = "1" ] || [ "$CONFIRM" = "yes" ] || [ "$CONFIRM" = "y" ]; then
+        log_info "CONFIRM=$CONFIRM; prosseguindo sem prompt interativo"
+        return 0
+    fi
+    if [ ! -t 0 ]; then
+        log_error "Entrada não interativa e CONFIRM não setado; abortando antes de operar em $bucket"
+        return 1
+    fi
+    local reply
+    read -r -p "Digite 'yes' para operar neste bucket: " reply
+    if [ "$reply" != "yes" ]; then
+        log_error "Confirmação negada; abortando"
+        return 1
+    fi
+    return 0
+}
+
+find_compliance_bucket() {
+    log_info "Identificando bucket S3 de compliance..."
+
+    local candidate=""
+    if [ -n "$BUCKET_NAME" ]; then
+        log_info "Usando bucket informado pelo operador: $BUCKET_NAME"
+        candidate="$BUCKET_NAME"
+    else
+        log_info "Lendo output 'ComplianceBucketName' da stack $STORAGE_STACK_NAME..."
+        candidate=$(resolve_bucket_from_stack "$STORAGE_STACK_NAME") || {
+            log_error "Falha ao resolver o bucket a partir da stack $STORAGE_STACK_NAME"
+            log_error "Passe --bucket <nome> ou defina BUCKET_NAME para resolver manualmente"
+            return 1
+        }
+    fi
+
+    if ! verify_bucket_ownership "$candidate"; then
+        log_error "Verificação de ownership falhou para $candidate; abortando"
+        return 1
+    fi
+
+    if ! confirm_bucket "$candidate"; then
+        return 1
+    fi
+
+    COMPLIANCE_BUCKET="$candidate"
+    log_success "Bucket confirmado: $COMPLIANCE_BUCKET"
+    return 0
 }
 
 generate_test_data() {
