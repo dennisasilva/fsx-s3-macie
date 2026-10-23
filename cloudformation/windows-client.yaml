@@ -176,22 +176,34 @@ Resources:
                   $domainUser = "Admin"
                   
                   # Tentar obter a senha do Systems Manager Parameter Store
+                  # Nome real do parâmetro criado em fsx-storage.yaml: /<projectName>/ad/password
+                  # (exportado também como ${StorageStackName}-ADPasswordParameter)
+                  $adPasswordParameterName = "/$projectName/ad/password"
+                  $passwordParam = $null
                   try {
-                      $passwordParam = aws ssm get-parameter --name "${StorageStackName}-ADPassword" --with-decryption --region ${AWS::Region} --output text --query 'Parameter.Value'
-                      if ($passwordParam) {
+                      # Nunca ecoar a senha: redirecionar stdout/stderr e manter o valor apenas em memória
+                      $passwordParam = (aws ssm get-parameter --name $adPasswordParameterName --with-decryption --region ${AWS::Region} --query 'Parameter.Value' --output text 2>$null)
+                      if ([string]::IsNullOrWhiteSpace($passwordParam)) {
+                          Write-Host "❌ Não foi possível obter a senha do domínio no parâmetro $adPasswordParameterName"
+                      } else {
                           $securePassword = ConvertTo-SecureString $passwordParam -AsPlainText -Force
+                          # Limpar cópia em texto claro imediatamente após a conversão
+                          $passwordParam = $null
+                          Remove-Variable passwordParam -ErrorAction SilentlyContinue
                           $credential = New-Object System.Management.Automation.PSCredential("$domainName\$domainUser", $securePassword)
-                          
+
                           # Ingressar no domínio
                           Write-Host "🔗 Ingressando no domínio: $domainName"
                           Add-Computer -DomainName $domainName -Credential $credential -Restart -Force
                           Write-Host "✅ Ingresso no domínio iniciado - instância será reiniciada"
-                      } else {
-                          Write-Host "❌ Não foi possível obter a senha do domínio"
                       }
                   } catch {
                       Write-Host "❌ Erro ao ingressar no domínio: $($_.Exception.Message)"
                       Write-Host "⚠️ Será necessário ingressar manualmente no domínio para acessar FSx"
+                  } finally {
+                      # Garantir que a senha em texto claro nunca permaneça em variável/sessão
+                      $passwordParam = $null
+                      Remove-Variable passwordParam -ErrorAction SilentlyContinue
                   }
               } else {
                   Write-Host "❌ Managed AD não ficou disponível no tempo esperado"
@@ -585,6 +597,16 @@ Resources:
                 Action:
                   - 'sts:GetCallerIdentity'
                 Resource: '*'
+              # Permissão mínima para que o user-data recupere a senha do AD
+              # a partir do SSM Parameter Store (apenas o parâmetro deste projeto)
+              - Effect: Allow
+                Action:
+                  - 'ssm:GetParameter'
+                Resource:
+                  - !Sub
+                    - 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/ad/password'
+                    - ProjectName: !ImportValue
+                        Fn::Sub: '${MainStackName}-ProjectName'
       Tags:
         - Key: Name
           Value: !Sub 
