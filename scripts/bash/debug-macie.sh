@@ -1,4 +1,16 @@
-cat > /tmp/test-debug.sh << 'EOF'
+#!/bin/bash
+# ============================================================================
+# Gera um script temporário de debug para o Macie em um caminho privado.
+# Evita paths previsíveis em /tmp (symlink/clobber via `cat >`).
+# ============================================================================
+set -e
+set -C
+umask 077
+
+DEBUG_SCRIPT="$(mktemp -t fsx-macie-debug.XXXXXXXX.sh)"
+chmod 700 "$DEBUG_SCRIPT"
+
+cat > "$DEBUG_SCRIPT" << 'EOF'
 #!/bin/bash
 
 # FSx Compliance Test - Versão com Debug Detalhado
@@ -178,3 +190,7 @@ main() {
 
 main "$@"
 EOF
+
+chmod 700 "$DEBUG_SCRIPT"
+echo "Script de debug gerado em: $DEBUG_SCRIPT"
+echo "Remova manualmente após uso: rm -f -- \"$DEBUG_SCRIPT\""

@@ -8,13 +8,27 @@
 # ============================================================================
 
 set -e
+# Prevent redirection from clobbering files via planted symlinks and keep temp files private.
+set -C
+umask 077
 
 # Configurações padrão
 NUM_FILES=${1:-3}
 ACTION=${2:-"test"}  # test, monitor, cleanup
 AWS_REGION=${AWS_REGION:-"us-east-1"}
-TEST_DIR="/tmp/fsx-compliance-test"
+# Diretório de teste privado criado via mktemp para evitar caminho previsível em /tmp.
+# (Usado apenas por ações que geram dados locais; a ação `cleanup` continua existindo
+#  como no-op local porque não há mais caminho fixo a limpar — a limpeza do S3 é mantida.)
+TEST_DIR="$(mktemp -d -t fsx-compliance-test.XXXXXXXX)"
+chmod 700 "$TEST_DIR"
 DATA_DIR="$TEST_DIR/test-data"
+mkdir -p "$DATA_DIR"
+chmod 700 "$DATA_DIR"
+# Rastrear os arquivos que este script gerou, para enviar apenas eles ao S3
+# (nunca globar o diretório inteiro — evita subir arquivos plantados).
+GENERATED_FILES=()
+# Garantir limpeza do diretório temporário em qualquer saída.
+trap 'rm -rf -- "$TEST_DIR"' EXIT INT TERM HUP
 
 # Cores para output
 RED='\033[0;31m'
@@ -94,8 +108,8 @@ generate_test_data() {
     
     log_info "Gerando $num_files arquivos com dados sensíveis fictícios..."
     
-    # Criar diretório de dados de teste
-    mkdir -p "$DATA_DIR"
+    # $DATA_DIR já foi criado via mktemp -d no topo do script com perms privadas.
+    chmod 700 "$DATA_DIR"
     
     # Templates de documentos
     local templates=(
@@ -173,6 +187,7 @@ Finalidade: Teste de Compliance
 === FIM DO DOCUMENTO ===
 EOF
         
+        GENERATED_FILES+=("$filepath")
         log_success "Criado: $filename"
     done
     
@@ -192,10 +207,11 @@ upload_to_s3() {
         log_info "Criando prefixo fsx-sync/ no bucket"
     }
     
-    # Upload dos arquivos
+    # Upload apenas dos arquivos que este script gerou. Nunca globar $DATA_DIR
+    # para evitar enviar arquivos plantados por outro usuário.
     local upload_count=0
-    for file in "$DATA_DIR"/*; do
-        if [ -f "$file" ]; then
+    for file in "${GENERATED_FILES[@]}"; do
+        if [ -f "$file" ] && [ ! -L "$file" ]; then
             local filename=$(basename "$file")
             aws s3 cp "$file" "s3://$COMPLIANCE_BUCKET/fsx-sync/$filename"
             ((upload_count++))
@@ -367,9 +383,9 @@ EOF
 cleanup_test_data() {
     log_info "Limpando dados de teste..."
     
-    # Remover arquivos locais
-    if [ -d "$TEST_DIR" ]; then
-        rm -rf "$TEST_DIR"
+    # Remover arquivos locais da instância atual (serão também removidos pelo trap EXIT).
+    if [ -n "${TEST_DIR:-}" ] && [ -d "$TEST_DIR" ]; then
+        rm -rf -- "$TEST_DIR"
         log_success "Arquivos locais removidos"
     fi
     
@@ -428,8 +444,7 @@ main() {
             check_prerequisites
             find_compliance_bucket || exit 1
             
-            # Criar diretório de trabalho
-            mkdir -p "$TEST_DIR"
+            # $TEST_DIR / $DATA_DIR já foram criados via mktemp -d no topo do script.
             
             generate_test_data "$NUM_FILES"
             upload_to_s3
