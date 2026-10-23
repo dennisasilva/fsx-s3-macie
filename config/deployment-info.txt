@@ -7,7 +7,7 @@ Infrastructure:
 - Windows Instance IP: 10.0.1.245
 - Windows Instance ID: i-2093849021384092
 - SNS Topic: arn:aws:sns:us-east-1:123456789012:fsx-compliance-poc-compliance-alerts
-- Notification Email: dennis@dennis.com
+- Notification Email: ops@example.com
 - Region: us-east-1
 
 Access Commands:
