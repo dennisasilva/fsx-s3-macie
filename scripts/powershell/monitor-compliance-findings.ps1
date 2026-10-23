@@ -10,9 +10,13 @@ param(
     [int]$MaxFindings = 50,
     [switch]$ShowDetails,
     [switch]$ExportReport,
-    [string]$ReportPath = "C:\ComplianceReports",
+    # Default to a per-user, non-world-readable location instead of the root of C:\
+    # (which inherits BUILTIN\Users:(OI)(CI)(RX) from the volume root ACL).
+    [string]$ReportPath = (Join-Path $env:LOCALAPPDATA "ComplianceReports"),
     [switch]$Continuous,
-    [int]$RefreshInterval = 300  # 5 minutos
+    [int]$RefreshInterval = 300,  # 5 minutos
+    # Number of days to keep exported reports; older files are purged on each export.
+    [int]$ReportRetentionDays = 7
 )
 
 Write-Host "=== FSx COMPLIANCE POC - MONITOR DE FINDINGS ===" -ForegroundColor Cyan
@@ -175,20 +179,97 @@ function Format-FindingReport {
     }
 }
 
+# Função auxiliar: aplica ACL restritiva (Administrators, SYSTEM e usuário corrente)
+function Set-RestrictiveAcl {
+    param([Parameter(Mandatory=$true)][string]$Path)
+
+    try {
+        $acl = New-Object System.Security.AccessControl.DirectorySecurity
+        # Replace inherited ACEs with explicit, minimal ones.
+        $acl.SetAccessRuleProtection($true, $false)
+
+        $rights = [System.Security.AccessControl.FileSystemRights]::FullControl
+        $inherit = [System.Security.AccessControl.InheritanceFlags]'ContainerInherit,ObjectInherit'
+        $prop = [System.Security.AccessControl.PropagationFlags]::None
+        $allow = [System.Security.AccessControl.AccessControlType]::Allow
+
+        $admins = New-Object System.Security.Principal.SecurityIdentifier(
+            [System.Security.Principal.WellKnownSidType]::BuiltinAdministratorsSid, $null)
+        $system = New-Object System.Security.Principal.SecurityIdentifier(
+            [System.Security.Principal.WellKnownSidType]::LocalSystemSid, $null)
+        $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+
+        foreach ($sid in @($admins, $system, $currentUser)) {
+            $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+                $sid, $rights, $inherit, $prop, $allow)
+            $acl.AddAccessRule($rule)
+        }
+
+        $acl.SetOwner($admins)
+        Set-Acl -Path $Path -AclObject $acl
+    } catch {
+        Write-Host "⚠️  Não foi possível aplicar ACL restritiva em $Path: $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+}
+
+# Função auxiliar: projeta apenas campos não-sensíveis do finding para o relatório
+function ConvertTo-RedactedFinding {
+    param($Finding)
+
+    $sensitiveSummary = @()
+    if ($Finding.classificationDetails -and $Finding.classificationDetails.result -and $Finding.classificationDetails.result.sensitiveData) {
+        foreach ($category in $Finding.classificationDetails.result.sensitiveData) {
+            $detTypes = @()
+            $totalCount = 0
+            if ($category.detections) {
+                foreach ($d in $category.detections) {
+                    $detTypes += $d.type
+                    if ($d.count) { $totalCount += [int]$d.count }
+                }
+            }
+            $sensitiveSummary += [PSCustomObject]@{
+                category        = $category.category
+                detectionTypes  = ($detTypes | Sort-Object -Unique)
+                totalOccurrences = $totalCount
+            }
+        }
+    }
+
+    [PSCustomObject]@{
+        id        = $Finding.id
+        type      = $Finding.type
+        severity  = $Finding.severity
+        createdAt = $Finding.createdAt
+        # Deliberately omit resourcesAffected.s3Object.bucketName/key and raw
+        # classificationDetails.result (which contain the sensitive-data inventory).
+        sensitiveDataSummary = $sensitiveSummary
+    }
+}
+
 # Função para exportar relatório
 function Export-FindingReport {
-    param($Findings, $ReportPath)
+    param($Findings, $ReportPath, [int]$RetentionDays = 7)
     
     if (!(Test-Path $ReportPath)) {
         New-Item -ItemType Directory -Path $ReportPath -Force | Out-Null
+        # New directory: lock down ACL on creation so interactive BUILTIN\Users
+        # on this host cannot read the reports.
+        Set-RestrictiveAcl -Path $ReportPath
+    } else {
+        # Existing directory: re-assert the restrictive ACL in case the
+        # directory was created previously with inherited permissions.
+        Set-RestrictiveAcl -Path $ReportPath
     }
     
     $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
     $reportFile = Join-Path $ReportPath "MacieFindings_$timestamp.json"
     $summaryFile = Join-Path $ReportPath "MacieSummary_$timestamp.txt"
     
-    # Exportar JSON completo
-    $Findings | ConvertTo-Json -Depth 10 | Out-File -FilePath $reportFile -Encoding UTF8
+    # Exportar apenas campos não-sensíveis (sem bucket/key nem detecções brutas).
+    # O inventario completo permanece no Macie/S3 (com SSE-KMS e controle de acesso
+    # server-side) e não deve ser copiado em texto claro para o cliente.
+    $redacted = @($Findings | ForEach-Object { ConvertTo-RedactedFinding -Finding $_ })
+    $redacted | ConvertTo-Json -Depth 4 | Out-File -FilePath $reportFile -Encoding UTF8
     
     # Criar resumo em texto
     $summary = @"
@@ -206,11 +287,7 @@ TIPOS DE DADOS SENSÍVEIS DETECTADOS:
 $($Findings | Group-Object type | ForEach-Object { "- $($_.Name): $($_.Count) ocorrências" } | Out-String)
 
 ARQUIVOS MAIS AFETADOS:
-$($Findings | Where-Object {$_.resourcesAffected.s3Object} | 
-  Group-Object {$_.resourcesAffected.s3Object.key} | 
-  Sort-Object Count -Descending | 
-  Select-Object -First 10 | 
-  ForEach-Object { "- $($_.Name): $($_.Count) findings" } | Out-String)
+(omitido do arquivo exportado para evitar cleartext storage de chaves S3; consulte o Macie / S3 com SSE-KMS para o inventário detalhado)
 
 RECOMENDAÇÕES:
 1. Revisar arquivos com findings de alta severidade
@@ -223,10 +300,27 @@ RECOMENDAÇÕES:
 "@
     
     $summary | Out-File -FilePath $summaryFile -Encoding UTF8
-    
-    Write-Host "📄 Relatório exportado:" -ForegroundColor Green
+
+    # Retention/cleanup: remove reports older than $RetentionDays days so the
+    # exported inventory is not retained indefinitely on the client.
+    if ($RetentionDays -gt 0) {
+        try {
+            $cutoff = (Get-Date).AddDays(-$RetentionDays)
+            Get-ChildItem -Path $ReportPath -File -Filter "MacieFindings_*.json" -ErrorAction SilentlyContinue |
+                Where-Object { $_.LastWriteTime -lt $cutoff } |
+                Remove-Item -Force -ErrorAction SilentlyContinue
+            Get-ChildItem -Path $ReportPath -File -Filter "MacieSummary_*.txt" -ErrorAction SilentlyContinue |
+                Where-Object { $_.LastWriteTime -lt $cutoff } |
+                Remove-Item -Force -ErrorAction SilentlyContinue
+        } catch {
+            Write-Host "⚠️  Falha ao limpar relatórios antigos: $($_.Exception.Message)" -ForegroundColor Yellow
+        }
+    }
+
+    Write-Host "📄 Relatório exportado (campos sensíveis omitidos):" -ForegroundColor Green
     Write-Host "   JSON: $reportFile" -ForegroundColor Gray
     Write-Host "   Resumo: $summaryFile" -ForegroundColor Gray
+    Write-Host "   Retenção: $RetentionDays dia(s)" -ForegroundColor Gray
 }
 
 # Função para monitoramento contínuo
@@ -279,7 +373,7 @@ try {
             Format-FindingReport -Findings $result.Findings
             
             if ($ExportReport) {
-                Export-FindingReport -Findings $result.Findings -ReportPath $ReportPath
+                Export-FindingReport -Findings $result.Findings -ReportPath $ReportPath -RetentionDays $ReportRetentionDays
             }
         }
         
