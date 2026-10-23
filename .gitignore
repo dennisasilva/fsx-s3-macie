@@ -1,0 +1,3 @@
+# Local, per-operator deploy cache written by scripts/bash/deploy-fsx-compliance-poc.sh.
+# Must never be committed: a planted value could be re-read by the deploy script.
+config/.fsx-compliance-config
