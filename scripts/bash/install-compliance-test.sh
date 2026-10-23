@@ -7,14 +7,18 @@
 # ============================================================================
 
 set -e
+# Avoid clobbering an attacker-planted file via redirection, and keep temp files private.
+set -C
+umask 077
 
 echo "=== FSx COMPLIANCE TEST - INSTALADOR RÁPIDO ==="
 echo "Configurando teste de compliance para Linux..."
 echo ""
 
-# Criar diretório de trabalho
-WORK_DIR="/tmp/compliance-test"
-mkdir -p "$WORK_DIR"
+# Criar diretório de trabalho privado via mktemp para evitar caminhos previsíveis em /tmp
+# (prevents symlink/content-substitution against a fixed /tmp/compliance-test path).
+WORK_DIR="$(mktemp -d -t fsx-compliance-install.XXXXXXXX)"
+chmod 700 "$WORK_DIR"
 cd "$WORK_DIR"
 
 echo "✅ Diretório criado: $WORK_DIR"
@@ -27,16 +31,29 @@ if ! command -v jq &> /dev/null; then
     echo "✅ jq instalado"
 fi
 
-# Criar script principal inline
-cat > compliance-test.sh << 'SCRIPT_EOF'
+# Criar script principal inline em caminho privado (noclobber ativo via `set -C`)
+SCRIPT_PATH="$WORK_DIR/compliance-test.sh"
+cat > "$SCRIPT_PATH" << 'SCRIPT_EOF'
 #!/bin/bash
+
+set -e
+set -C
+umask 077
 
 # Configurações
 NUM_FILES=${1:-3}
 ACTION=${2:-"test"}
 AWS_REGION=${AWS_REGION:-"us-east-1"}
-TEST_DIR="/tmp/fsx-compliance-test"
+# Diretório de trabalho privado criado por mktemp para evitar caminho previsível em /tmp.
+TEST_DIR="$(mktemp -d -t fsx-compliance-test.XXXXXXXX)"
+chmod 700 "$TEST_DIR"
 DATA_DIR="$TEST_DIR/test-data"
+mkdir -p "$DATA_DIR"
+chmod 700 "$DATA_DIR"
+# Rastrear apenas os arquivos que este script gerar para upload (evita subir arquivos plantados).
+GENERATED_FILES=()
+# Cleanup automático do diretório privado.
+trap 'rm -rf -- "$TEST_DIR"' EXIT INT TERM HUP
 
 # Cores
 RED='\033[0;31m'
@@ -78,7 +95,8 @@ generate_test_data() {
     local num_files=$1
     
     log_info "Gerando $num_files arquivos com dados sensíveis fictícios..."
-    mkdir -p "$DATA_DIR"
+    # $DATA_DIR foi criado via mktemp -d acima; apenas garantir perms privadas.
+    chmod 700 "$DATA_DIR"
     
     for i in $(seq 1 $num_files); do
         local timestamp=$(date +%Y%m%d_%H%M%S)
@@ -131,6 +149,7 @@ FICTÍCIOS e criados apenas para demonstração.
 
 === FIM DO DOCUMENTO ===
 EOF
+        GENERATED_FILES+=("$filepath")
         
         log_success "Criado: $filename"
     done
@@ -145,8 +164,10 @@ upload_to_s3() {
     log_info "Enviando arquivos para S3..."
     
     local upload_count=0
-    for file in "$DATA_DIR"/*; do
-        if [ -f "$file" ]; then
+    # Enviar apenas os arquivos que este script gerou; nunca globar $DATA_DIR
+    # para evitar upload de arquivos plantados por outro usuário.
+    for file in "${GENERATED_FILES[@]}"; do
+        if [ -f "$file" ] && [ ! -L "$file" ]; then
             local filename=$(basename "$file")
             aws s3 cp "$file" "s3://$COMPLIANCE_BUCKET/fsx-sync/$filename"
             ((upload_count++))
@@ -260,7 +281,7 @@ main() {
             fi
             
             find_compliance_bucket || exit 1
-            mkdir -p "$TEST_DIR"
+            # $TEST_DIR / $DATA_DIR foram criados via mktemp -d no topo do script.
             generate_test_data "$NUM_FILES"
             upload_to_s3
             
@@ -284,21 +305,21 @@ main() {
 main "$@"
 SCRIPT_EOF
 
-# Dar permissão de execução
-chmod +x compliance-test.sh
+# Dar permissão de execução (perms privadas: só o dono executa).
+chmod 700 "$SCRIPT_PATH"
 
-echo "✅ Script principal criado: compliance-test.sh"
+echo "✅ Script principal criado: $SCRIPT_PATH"
 echo ""
 echo "🚀 COMO USAR:"
 echo ""
 echo "# Executar teste completo (gerar 3 arquivos)"
-echo "./compliance-test.sh 3 test"
+echo "$SCRIPT_PATH 3 test"
 echo ""
 echo "# Criar job imediato do Macie"
-echo "./compliance-test.sh 0 job"
+echo "$SCRIPT_PATH 0 job"
 echo ""
 echo "# Monitorar findings"
-echo "./compliance-test.sh 0 monitor"
+echo "$SCRIPT_PATH 0 monitor"
 echo ""
 echo "✅ INSTALAÇÃO CONCLUÍDA!"
-echo "Execute: ./compliance-test.sh 3 test"
+echo "Execute: $SCRIPT_PATH 3 test"

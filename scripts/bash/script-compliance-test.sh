@@ -1,8 +1,12 @@
 ## Execute esse comando manualmente copiando o conteúdo direto no terminal EC2##
+## Usa mktemp para evitar caminhos previsíveis em /tmp (ataques de symlink/clobber).##
 
 
-mkdir -p /tmp/compliance-test && cd /tmp/compliance-test && cat > test.sh << 'EOF'
+umask 077 && set -C && WORK_DIR="$(mktemp -d -t fsx-compliance.XXXXXXXX)" && chmod 700 "$WORK_DIR" && cd "$WORK_DIR" && TEST_SH="$WORK_DIR/test.sh" && cat > "$TEST_SH" << 'EOF'
 #!/bin/bash
+
+set -C
+umask 077
 
 # FSx Compliance Test - Linux Version
 NUM_FILES=${1:-3}
@@ -112,13 +116,18 @@ echo "📄 Gerando $NUM_FILES arquivos com dados sensíveis fictícios..."
 
 find_bucket || exit 1
 
-# Criar diretório de dados de teste
-mkdir -p /tmp/test-data
+# Criar diretório de dados de teste em caminho privado (mktemp) para evitar
+# que outro usuário local plante arquivos em um caminho fixo e previsível.
+DATA_DIR="$(mktemp -d -t fsx-test-data.XXXXXXXX)"
+chmod 700 "$DATA_DIR"
+# Rastrear arquivos gerados para o upload (nunca globar o diretório).
+GENERATED_FILES=()
+trap 'rm -rf -- "$DATA_DIR"' EXIT INT TERM HUP
 
 for i in $(seq 1 $NUM_FILES); do
     timestamp=$(date +%Y%m%d_%H%M%S)
     filename="TestDocument_${i}_${timestamp}.txt"
-    filepath="/tmp/test-data/$filename"
+    filepath="$DATA_DIR/$filename"
     
     # Gerar dados fictícios variados
     cpf="$(printf "%03d" $((100 + i))).$(printf "%03d" $((200 + i))).$(printf "%03d" $((300 + i)))-$(printf "%02d" $((10 + i)))"
@@ -177,16 +186,17 @@ Finalidade: Teste de Compliance
 === FIM DO DOCUMENTO ===
 DOCEOF
     
+    GENERATED_FILES+=("$filepath")
     echo "✅ Criado: $filename"
 done
 
 echo ""
 echo "📤 Enviando arquivos para S3..."
 
-# Upload para S3
+# Upload para S3 (apenas os arquivos gerados por este script).
 upload_count=0
-for file in /tmp/test-data/*; do
-    if [ -f "$file" ]; then
+for file in "${GENERATED_FILES[@]}"; do
+    if [ -f "$file" ] && [ ! -L "$file" ]; then
         filename=$(basename "$file")
         if aws s3 cp "$file" "s3://$BUCKET/fsx-sync/$filename"; then
             echo "✅ Enviado: $filename"
@@ -220,6 +230,10 @@ echo "   • CloudWatch Logs: https://console.aws.amazon.com/cloudwatch/"
 echo ""
 echo "⚠️  LEMBRETE:"
 echo "   Todos os dados são FICTÍCIOS para teste apenas!"
-echo "   Remova após validação: rm -rf /tmp/test-data"
+echo "   O diretório temporário ($DATA_DIR) será removido ao sair do script."
 
 EOF
+
+chmod 700 "$TEST_SH"
+echo "Script salvo em: $TEST_SH"
+echo "Execute com: \"$TEST_SH\" <num_files> <action>"

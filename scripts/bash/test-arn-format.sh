@@ -4,6 +4,16 @@
 # Valida se os ARNs estão no formato correto antes do deploy
 
 set -e
+# Prevent redirection from clobbering an existing file via a planted symlink/path.
+set -C
+# Private perms for any files we create.
+umask 077
+
+# Secure staging dir and auto-cleanup to avoid predictable /tmp paths.
+STAGE_DIR="$(mktemp -d -t fsx-arn-format.XXXXXXXX)"
+chmod 700 "$STAGE_DIR"
+trap 'rm -rf -- "$STAGE_DIR"' EXIT INT TERM HUP
+POLICY_FILE="$STAGE_DIR/test-policy.json"
 
 # Cores para output
 RED='\033[0;31m'
@@ -86,8 +96,8 @@ echo ""
 echo "=== VALIDAÇÃO DE POLÍTICA IAM ==="
 echo ""
 
-# Criar política de teste
-cat > /tmp/test-policy.json << EOF
+# Criar política de teste em diretório temporário seguro
+cat > "$POLICY_FILE" << EOF
 {
   "Version": "2012-10-17",
   "Statement": [
@@ -113,7 +123,7 @@ cat > /tmp/test-policy.json << EOF
 EOF
 
 info "Política IAM gerada:"
-cat /tmp/test-policy.json
+cat "$POLICY_FILE"
 
 echo ""
 echo "=== VALIDAÇÃO COM AWS CLI ==="
@@ -123,13 +133,13 @@ echo ""
 if command -v aws &> /dev/null; then
     info "Validando política com AWS CLI..."
     
-    if aws iam validate-policy-document --policy-document file:///tmp/test-policy.json --output table 2>/dev/null; then
+    if aws iam validate-policy-document --policy-document "file://$POLICY_FILE" --output table 2>/dev/null; then
         success "Política IAM válida!"
     else
         error "Política IAM inválida!"
         echo ""
         warning "Executando validação com detalhes:"
-        aws iam validate-policy-document --policy-document file:///tmp/test-policy.json || true
+        aws iam validate-policy-document --policy-document "file://$POLICY_FILE" || true
     fi
 else
     warning "AWS CLI não disponível - pulando validação"
@@ -151,8 +161,8 @@ echo "    - BucketArn: !GetAtt ComplianceBucket.Arn"
 echo ""
 echo "  Resource: !GetAtt ComplianceBucket.Arn"
 
-# Limpeza
-rm -f /tmp/test-policy.json
+# Limpeza explícita (além do trap EXIT)
+rm -f -- "$POLICY_FILE"
 
 echo ""
 success "Teste de formato de ARN concluído!"

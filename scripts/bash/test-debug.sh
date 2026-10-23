@@ -1,6 +1,11 @@
 #!/bin/bash
 
 # FSx Compliance Test - Versão com Debug Detalhado
+
+# Evita clobber de caminhos previsíveis via redirecionamento e cria arquivos privados.
+set -C
+umask 077
+
 NUM_FILES=${1:-3}
 ACTION=${2:-"test"}
 AWS_REGION="us-east-1"
@@ -154,8 +159,11 @@ create_job_detailed() {
         fi
     fi
     
-    # Criar arquivo temporário com a definição do job
-    JOB_DEF_FILE="/tmp/macie-job-def.json"
+    # Criar arquivo temporário com a definição do job em caminho privado (evita /tmp previsível).
+    JOB_DEF_FILE="$(mktemp -t macie-job-def.XXXXXXXX.json)"
+    chmod 600 "$JOB_DEF_FILE"
+    # Limpar em qualquer saída desta função/script.
+    trap 'rm -f -- "$JOB_DEF_FILE"' EXIT INT TERM HUP
     cat > "$JOB_DEF_FILE" << EOF
 {
     "jobType": "ONE_TIME",
@@ -300,11 +308,16 @@ main() {
             
             # Gerar e enviar dados (código existente)
             log_info "Gerando $NUM_FILES arquivos de teste..."
-            mkdir -p /tmp/test-data
+            # Diretório temporário privado via mktemp para evitar /tmp previsível.
+            TEST_DATA_DIR="$(mktemp -d -t fsx-test-data.XXXXXXXX)"
+            chmod 700 "$TEST_DATA_DIR"
+            # Rastrear os arquivos realmente gerados por este script.
+            GENERATED_TEST_FILES=()
+            trap 'rm -rf -- "$TEST_DATA_DIR"' EXIT INT TERM HUP
             
             for i in $(seq 1 $NUM_FILES); do
                 filename="TestDoc_${i}_$(date +%Y%m%d_%H%M%S).txt"
-                cat > "/tmp/test-data/$filename" << EOF
+                cat > "$TEST_DATA_DIR/$filename" << EOF
 CONFIDENCIAL - Documento $i
 Data: $(date)
 CPF: 123.456.789-0$i
@@ -313,11 +326,17 @@ Cartão: 4532-1234-5678-901$i
 DADOS PESSOAIS FICTÍCIOS
 RESTRITO - SIGILOSO
 EOF
+                GENERATED_TEST_FILES+=("$TEST_DATA_DIR/$filename")
                 log_success "Criado: $filename"
             done
             
             log_info "Enviando para S3..."
-            aws s3 cp /tmp/test-data/ "s3://$COMPLIANCE_BUCKET/fsx-sync/" --recursive
+            # Enviar apenas os arquivos gerados por este script (nunca globar o diretório).
+            for f in "${GENERATED_TEST_FILES[@]}"; do
+                if [ -f "$f" ] && [ ! -L "$f" ]; then
+                    aws s3 cp "$f" "s3://$COMPLIANCE_BUCKET/fsx-sync/$(basename "$f")"
+                fi
+            done
             log_success "Arquivos enviados!"
             
             log_info "Execute: $0 0 job (para criar job)"
