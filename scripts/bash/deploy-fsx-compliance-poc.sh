@@ -59,6 +59,10 @@ critical() {
 
 # Função para salvar configurações
 save_config() {
+    # Criar com permissões restritivas (apenas o dono pode ler/escrever).
+    local _old_umask
+    _old_umask=$(umask)
+    umask 077
     cat > "$CONFIG_FILE" << EOF
 # FSx Compliance PoC - Configurações Salvas
 # Gerado automaticamente em $(date)
@@ -67,28 +71,100 @@ REGION="$REGION"
 PROJECT_NAME="$PROJECT_NAME"
 LAST_DEPLOY=$(date +%s)
 EOF
+    chmod 600 "$CONFIG_FILE" 2>/dev/null || true
+    umask "$_old_umask"
     success "Configurações salvas em $CONFIG_FILE"
 }
 
 # Função para carregar configurações
+#
+# IMPORTANTE: NÃO usar `source` em um arquivo de dados. O cache é tratado
+# como dados puros: só chaves conhecidas são aceitas e cada valor passa
+# por validação antes de ser atribuído. Isso elimina execução arbitrária
+# de código caso o arquivo seja alterado por outro usuário local ou por
+# um commit malicioso.
 load_config() {
-    if [ -f "$CONFIG_FILE" ]; then
-        source "$CONFIG_FILE"
-        info "Configurações carregadas de $CONFIG_FILE"
-        
-        # Mostrar configurações carregadas
-        if [ ! -z "$NOTIFICATION_EMAIL" ]; then
-            info "Email salvo: $NOTIFICATION_EMAIL"
-        fi
-        if [ ! -z "$REGION" ]; then
-            info "Região salva: $REGION"
-        fi
-        
-        return 0
-    else
+    if [ ! -f "$CONFIG_FILE" ]; then
         info "Nenhuma configuração salva encontrada"
         return 1
     fi
+
+    # Recusar o arquivo se não for do usuário atual ou se estiver com
+    # permissões de escrita para grupo/outros (impede plantio por terceiros).
+    if [ ! -O "$CONFIG_FILE" ]; then
+        warning "Ignorando $CONFIG_FILE: arquivo não pertence ao usuário atual (uid=$(id -u))"
+        return 1
+    fi
+    local _cfg_perms
+    _cfg_perms=$(stat -c '%a' "$CONFIG_FILE" 2>/dev/null || stat -f '%Lp' "$CONFIG_FILE" 2>/dev/null || echo "")
+    if [ -n "$_cfg_perms" ] && [ "${#_cfg_perms}" -ge 3 ]; then
+        local _group_bits=${_cfg_perms: -2:1}
+        local _other_bits=${_cfg_perms: -1}
+        if [ "$((_group_bits & 2))" -ne 0 ] || [ "$((_other_bits & 2))" -ne 0 ]; then
+            warning "Ignorando $CONFIG_FILE: permissões $_cfg_perms permitem escrita por grupo/outros"
+            return 1
+        fi
+    fi
+
+    # Leitor explícito key=value com allow-list. Nunca interpreta o arquivo
+    # como shell script; valores entre aspas duplas são aceitos literalmente.
+    local _k _v
+    while IFS='=' read -r _k _v || [ -n "$_k" ]; do
+        # Pular comentários e linhas em branco
+        case "$_k" in
+            ''|\#*) continue ;;
+        esac
+        # Remover aspas duplas/simples envolventes e espaços nas bordas
+        _v="${_v#\"}"; _v="${_v%\"}"
+        _v="${_v#\'}"; _v="${_v%\'}"
+        _v="${_v#"${_v%%[![:space:]]*}"}"
+        _v="${_v%"${_v##*[![:space:]]}"}"
+        case "$_k" in
+            NOTIFICATION_EMAIL)
+                # Re-validar com o mesmo regex de e-mail usado na entrada interativa.
+                if [[ "$_v" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]]; then
+                    NOTIFICATION_EMAIL="$_v"
+                else
+                    warning "Ignorando NOTIFICATION_EMAIL inválido em $CONFIG_FILE"
+                fi
+                ;;
+            REGION)
+                if [[ "$_v" =~ ^[a-z]{2}-[a-z]+-[0-9]+$ ]]; then
+                    REGION="$_v"
+                else
+                    warning "Ignorando REGION inválido em $CONFIG_FILE"
+                fi
+                ;;
+            PROJECT_NAME)
+                if [[ "$_v" =~ ^[A-Za-z][A-Za-z0-9-]{0,63}$ ]]; then
+                    PROJECT_NAME="$_v"
+                else
+                    warning "Ignorando PROJECT_NAME inválido em $CONFIG_FILE"
+                fi
+                ;;
+            LAST_DEPLOY)
+                # Apenas informativo; aceitar inteiros.
+                if [[ "$_v" =~ ^[0-9]+$ ]]; then
+                    LAST_DEPLOY="$_v"
+                fi
+                ;;
+            *)
+                # Chave desconhecida: ignorar silenciosamente.
+                ;;
+        esac
+    done < "$CONFIG_FILE"
+
+    info "Configurações carregadas de $CONFIG_FILE"
+
+    # Mostrar configurações carregadas
+    if [ ! -z "$NOTIFICATION_EMAIL" ]; then
+        info "Email salvo: $NOTIFICATION_EMAIL"
+    fi
+    if [ ! -z "$REGION" ]; then
+        info "Região salva: $REGION"
+    fi
+
+    return 0
 }
 
 # Função para limpar configurações
@@ -284,7 +360,10 @@ check_prerequisites() {
 deploy_stack() {
     local stack_name=$1
     local template_file=$2
-    local parameters=$3
+    shift 2
+    # Cada parameter-override é um argumento posicional separado,
+    # evitando word-splitting de valores vindos de configuração.
+    local parameters=("$@")
     
     log "Fazendo deploy da stack: $stack_name"
     
@@ -301,7 +380,7 @@ deploy_stack() {
     fi
     
     # Mostrar parâmetros que serão usados
-    info "Parâmetros: $parameters"
+    info "Parâmetros: ${parameters[*]}"
     
     # Tentar deploy com retry
     local max_attempts=3
@@ -313,7 +392,7 @@ deploy_stack() {
         if aws cloudformation deploy \
             --template-file "$template_file" \
             --stack-name "$stack_name" \
-            --parameter-overrides $parameters \
+            --parameter-overrides "${parameters[@]}" \
             --capabilities CAPABILITY_NAMED_IAM \
             --region "$REGION" \
             --no-fail-on-empty-changeset \
@@ -359,7 +438,8 @@ deploy_main_infrastructure() {
     deploy_stack \
         "${PROJECT_NAME}-main" \
         "$CLOUDFORMATION_DIR/fsx-compliance-main.yaml" \
-        "ProjectName=$PROJECT_NAME NotificationEmail=$NOTIFICATION_EMAIL"
+        "ProjectName=$PROJECT_NAME" \
+        "NotificationEmail=$NOTIFICATION_EMAIL"
 }
 
 # Deploy do FSx e S3
@@ -369,7 +449,8 @@ deploy_storage() {
     deploy_stack \
         "${PROJECT_NAME}-storage" \
         "$CLOUDFORMATION_DIR/fsx-storage.yaml" \
-        "MainStackName=${PROJECT_NAME}-main FSxStorageCapacity=32"
+        "MainStackName=${PROJECT_NAME}-main" \
+        "FSxStorageCapacity=32"
 }
 
 # Deploy do Macie e processamento
@@ -379,7 +460,8 @@ deploy_macie() {
     deploy_stack \
         "${PROJECT_NAME}-macie" \
         "$CLOUDFORMATION_DIR/macie-processing.yaml" \
-        "MainStackName=${PROJECT_NAME}-main StorageStackName=${PROJECT_NAME}-storage"
+        "MainStackName=${PROJECT_NAME}-main" \
+        "StorageStackName=${PROJECT_NAME}-storage"
 }
 
 # Deploy do cliente Windows (SEM KEY PAIR)
@@ -389,7 +471,9 @@ deploy_windows_client() {
     deploy_stack \
         "${PROJECT_NAME}-windows" \
         "$CLOUDFORMATION_DIR/windows-client.yaml" \
-        "MainStackName=${PROJECT_NAME}-main StorageStackName=${PROJECT_NAME}-storage InstanceType=t3.medium"
+        "MainStackName=${PROJECT_NAME}-main" \
+        "StorageStackName=${PROJECT_NAME}-storage" \
+        "InstanceType=t3.medium"
 }
 
 # Verificar status das stacks
