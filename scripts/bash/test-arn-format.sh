@@ -33,8 +33,18 @@ echo ""
 
 # Simular valores que serão gerados
 PROJECT_NAME="fsx-compliance-poc"
-ACCOUNT_ID="493301683711"
-REGION="us-east-1"
+# Resolve the AWS account ID at runtime like the sibling scripts do
+# (compliance-test-linux.sh, test-debug.sh, install-compliance-test.sh).
+# Fall back to the documented placeholder when the AWS CLI is unavailable or
+# no credentials are configured, so this helper never bakes a real account
+# number into the repository or into generated test artifacts.
+if command -v aws &> /dev/null; then
+    ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text 2>/dev/null || true)"
+fi
+if [[ -z "${ACCOUNT_ID:-}" || ! "$ACCOUNT_ID" =~ ^[0-9]{12}$ ]]; then
+    ACCOUNT_ID="123456789012"
+fi
+REGION="${AWS_REGION:-${AWS_DEFAULT_REGION:-us-east-1}}"
 BUCKET_NAME="${PROJECT_NAME}-compliance-${ACCOUNT_ID}-${REGION}"
 
 info "Simulando valores do CloudFormation:"

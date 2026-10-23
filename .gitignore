@@ -1,0 +1,19 @@
+# Deploy-generated environment details - never commit real account/operator data
+config/deployment-info.txt
+config/.fsx-compliance-config
+
+# Local AWS/credential files
+.aws/
+*.pem
+*.key
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# Build / log artifacts
+*.log
+/tmp/
